@@ -1,0 +1,1399 @@
+#!/usr/bin/env bash
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ap-hop - Aruba Central Client-to-AP SSH tool
+#
+# Quickly "hop" into the access point serving a wireless client
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+set -euo pipefail
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Constants
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+readonly VERSION="0.0.1"
+readonly SCRIPT_NAME="ap-hop"
+readonly DEFAULT_SSH_USER="admin"
+readonly DEFAULT_SSH_TIMEOUT=10
+
+readonly EXIT_SUCCESS=0
+readonly EXIT_ERROR=1
+readonly EXIT_CONFIG_ERROR=2
+readonly EXIT_API_ERROR=3
+readonly EXIT_SSH_ERROR=4
+readonly EXIT_VALIDATION_ERROR=5
+readonly EXIT_DEPENDENCY_ERROR=6
+
+# Order matters for menu display
+readonly DEFAULT_CLUSTERS='# Aruba Central API Gateway Clusters
+# Format: NAME|URL|TYPE
+# Lines starting with # are comments
+# Order determines menu display order
+Internal|https://internal-apigw.central.arubanetworks.com|Private
+Canada-1|https://apigw-ca.central.arubanetworks.com|Public
+US-West5|https://apigw-uswest5.central.arubanetworks.com|Public
+US-West4|https://apigw-uswest4.central.arubanetworks.com|Public
+US-East1|https://apigw-us-east-1.central.arubanetworks.com|Public
+US-1|https://app1-apigw.central.arubanetworks.com|Public
+US-2|https://apigw-prod2.central.arubanetworks.com|Public
+APAC-1|https://api-ap.central.arubanetworks.com|Public
+APAC-East1|https://apigw-apaceast.central.arubanetworks.com|Public
+APAC-South1|https://apigw-apacsouth.central.arubanetworks.com|Public
+EU-1|https://eu-apigw.central.arubanetworks.com|Public
+EU-Central2|https://apigw-eucentral2.central.arubanetworks.com|Public
+EU-Central3|https://apigw-eucentral3.central.arubanetworks.com|Public
+China-1|https://apigw.central.arubanetworks.com.cn|Public
+UAE-North1|https://apigw-uaenorth1.central.arubanetworks.com|Public'
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Global variables
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+VERBOSE=false
+DRY_RUN=false
+PROFILE=""
+CONFIG_DIR=""
+CONFIG_FILE=""
+CLUSTERS_FILE=""
+SSH_USER=""
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Utility functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+get_config_dir() {
+    echo "${XDG_CONFIG_HOME:-$HOME/.config}/$SCRIPT_NAME"
+}
+
+log_info() {
+    echo "$*"
+}
+
+log_error() {
+    echo "Error: $*" >&2
+}
+
+# Log verbose message to stderr (only if VERBOSE=true)
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "$*" >&2
+    fi
+}
+
+check_dependencies() {
+    local missing=()
+    
+    for cmd in curl jq sshpass; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing[*]}"
+        log_error "Please install them and try again."
+        exit "$EXIT_DEPENDENCY_ERROR"
+    fi
+}
+
+is_valid_json() {
+    echo "$1" | jq -e . &>/dev/null
+}
+
+ensure_config_dir() {
+    CONFIG_DIR="$(get_config_dir)"
+    CONFIG_FILE="$CONFIG_DIR/config"
+    CLUSTERS_FILE="$CONFIG_DIR/clusters"
+    
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        chmod 700 "$CONFIG_DIR"
+    fi
+}
+
+# Ensure clusters file exists with defaults
+ensure_clusters_file() {
+    if [[ ! -f "$CLUSTERS_FILE" ]]; then
+        echo "$DEFAULT_CLUSTERS" > "$CLUSTERS_FILE"
+        chmod 644 "$CLUSTERS_FILE"
+    fi
+}
+
+# Ensure config file exists
+ensure_config_file() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" << 'EOF'
+[_settings]
+default_profile=default
+ssh_timeout=10
+EOF
+        chmod 600 "$CONFIG_FILE"
+    fi
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# INI file functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Usage: read_ini_value <file> <section> <key>
+read_ini_value() {
+    local file="$1"
+    local section="$2"
+    local key="$3"
+    
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+    
+    awk -F '=' -v section="$section" -v key="$key" '
+        /^\[/ {
+            current_section = substr($0, 2, length($0) - 2)
+        }
+        current_section == section && $1 == key {
+            # Handle values with = in them
+            sub(/^[^=]*=/, "")
+            print
+            exit
+        }
+    ' "$file"
+}
+
+# Usage: ini_section_exists <file> <section>
+ini_section_exists() {
+    local file="$1"
+    local section="$2"
+    
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+    
+    grep -q "^\[$section\]$" "$file"
+}
+
+# Write a value to INI file (creates section if needed)
+# Usage: write_ini_value <file> <section> <key> <value>
+write_ini_value() {
+    local file="$1"
+    local section="$2"
+    local key="$3"
+    local value="$4"
+    local temp_file
+    
+    temp_file=$(mktemp)
+    
+    if [[ ! -f "$file" ]]; then
+        echo "[$section]" > "$file"
+        echo "$key=$value" >> "$file"
+        chmod 600 "$file"
+        rm -f "$temp_file"
+        return 0
+    fi
+    
+    # Check if section exists
+    if ! ini_section_exists "$file" "$section"; then
+        # Add new section at end of file
+        cp "$file" "$temp_file"
+        {
+            echo ""
+            echo "[$section]"
+            echo "$key=$value"
+        } >> "$temp_file"
+        mv "$temp_file" "$file"
+        return 0
+    fi
+    
+    # Section exists - update or add key
+    awk -v section="$section" -v key="$key" -v value="$value" '
+        BEGIN { in_section = 0; key_found = 0 }
+        /^\[/ {
+            if (in_section && !key_found) {
+                print key "=" value
+                key_found = 1
+            }
+            in_section = (substr($0, 2, length($0) - 2) == section)
+        }
+        in_section && index($0, key "=") == 1 {
+            print key "=" value
+            key_found = 1
+            next
+        }
+        { print }
+        END {
+            if (in_section && !key_found) {
+                print key "=" value
+            }
+        }
+    ' "$file" > "$temp_file"
+    
+    mv "$temp_file" "$file"
+}
+
+# Usage: delete_ini_section <file> <section>
+delete_ini_section() {
+    local file="$1"
+    local section="$2"
+    local temp_file
+    
+    if [[ ! -f "$file" ]]; then
+        return 0
+    fi
+    
+    temp_file=$(mktemp)
+    
+    awk -v section="$section" '
+        /^\[/ {
+            current_section = substr($0, 2, length($0) - 2)
+        }
+        current_section != section { print }
+    ' "$file" > "$temp_file"
+    
+    mv "$temp_file" "$file"
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Profile functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+get_default_profile() {
+    local default
+    default=$(read_ini_value "$CONFIG_FILE" "_settings" "default_profile")
+    echo "${default:-default}"
+}
+
+set_default_profile() {
+    local profile="$1"
+    write_ini_value "$CONFIG_FILE" "_settings" "default_profile" "$profile"
+}
+
+get_ssh_timeout() {
+    local timeout
+    timeout=$(read_ini_value "$CONFIG_FILE" "_settings" "ssh_timeout")
+    echo "${timeout:-$DEFAULT_SSH_TIMEOUT}"
+}
+
+# List all profile names (excluding _settings)
+list_profiles() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return
+    fi
+    
+    grep '^\[' "$CONFIG_FILE" | sed 's/\[\(.*\)\]/\1/' | grep -v '^_settings$' || true
+}
+
+profile_exists() {
+    local profile="$1"
+    ini_section_exists "$CONFIG_FILE" "$profile"
+}
+
+validate_profile() {
+    local profile="$1"
+    local missing=()
+    
+    for field in cluster customer_id client_id client_secret access_token refresh_token; do
+        local value
+        value=$(read_ini_value "$CONFIG_FILE" "$profile" "$field")
+        if [[ -z "$value" ]]; then
+            missing+=("$field")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Profile '$profile' is missing required fields: ${missing[*]}"
+        log_error "Run 'ap-hop config --profile $profile' to configure."
+        return 1
+    fi
+    
+    return 0
+}
+
+# Load profile into variables
+# Sets: CLUSTER, CLUSTER_URL, CUSTOMER_ID, CLIENT_ID, CLIENT_SECRET, 
+#       ACCESS_TOKEN, REFRESH_TOKEN, SSH_PASSWORD, TENANT_ID
+load_profile() {
+    local profile="$1"
+    
+    if ! profile_exists "$profile"; then
+        # Check if any profiles exist at all
+        local existing_profiles
+        existing_profiles=$(list_profiles)
+        if [[ -z "$existing_profiles" ]]; then
+            log_error "No profiles configured."
+            log_error "Run 'ap-hop config' to create your first profile."
+        else
+            log_error "Profile '$profile' does not exist."
+            log_error "Run 'ap-hop config --profile $profile' to create it, or use --profile to specify an existing one."
+        fi
+        exit "$EXIT_CONFIG_ERROR"
+    fi
+    
+    if ! validate_profile "$profile"; then
+        exit "$EXIT_CONFIG_ERROR"
+    fi
+    
+    CLUSTER=$(read_ini_value "$CONFIG_FILE" "$profile" "cluster")
+    # shellcheck disable=SC2034  
+    CUSTOMER_ID=$(read_ini_value "$CONFIG_FILE" "$profile" "customer_id")
+    CLIENT_ID=$(read_ini_value "$CONFIG_FILE" "$profile" "client_id")
+    CLIENT_SECRET=$(read_ini_value "$CONFIG_FILE" "$profile" "client_secret")
+    ACCESS_TOKEN=$(read_ini_value "$CONFIG_FILE" "$profile" "access_token")
+    REFRESH_TOKEN=$(read_ini_value "$CONFIG_FILE" "$profile" "refresh_token")
+    SSH_PASSWORD=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_password")
+    SSH_USER=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_user")
+    SSH_USER="${SSH_USER:-$DEFAULT_SSH_USER}"
+    
+    # Resolve cluster URL
+    CLUSTER_URL=$(get_cluster_url "$CLUSTER")
+    if [[ -z "$CLUSTER_URL" ]]; then
+        if [[ "$CLUSTER" == http* ]]; then
+            CLUSTER_URL="$CLUSTER"
+        else
+            log_error "Unknown cluster '$CLUSTER'. Check your clusters file."
+            exit "$EXIT_CONFIG_ERROR"
+        fi
+    fi
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Cluster functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+get_cluster_url() {
+    local name="$1"
+    
+    if [[ ! -f "$CLUSTERS_FILE" ]]; then
+        return 1
+    fi
+    
+    grep -v '^#' "$CLUSTERS_FILE" | grep -v '^$' | while IFS='|' read -r cluster_name url _type; do
+        if [[ "$cluster_name" == "$name" ]]; then
+            echo "$url"
+            return 0
+        fi
+    done
+}
+
+get_cluster_type() {
+    local name="$1"
+    
+    if [[ ! -f "$CLUSTERS_FILE" ]]; then
+        return 1
+    fi
+    
+    grep -v '^#' "$CLUSTERS_FILE" | grep -v '^$' | while IFS='|' read -r cluster_name _url cluster_type; do
+        if [[ "$cluster_name" == "$name" ]]; then
+            echo "$cluster_type"
+            return 0
+        fi
+    done
+}
+
+# List all clusters (for menu)
+list_clusters() {
+    if [[ ! -f "$CLUSTERS_FILE" ]]; then
+        echo "$DEFAULT_CLUSTERS" | grep -v '^#' | grep -v '^$'
+    else
+        grep -v '^#' "$CLUSTERS_FILE" | grep -v '^$'
+    fi
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Interactive config functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Display cluster selection menu and get choice
+# Usage: select_cluster [existing_cluster]
+select_cluster() {
+    local existing="${1:-}"
+    local clusters=()
+    local urls=()
+    local types=()
+    local i=1
+    local default_selection=1
+    
+    echo "" >&2
+    echo "Select Aruba Central cluster:" >&2
+    echo "" >&2
+    
+    while IFS='|' read -r name url type; do
+        clusters+=("$name")
+        urls+=("$url")
+        types+=("$type")
+        
+        # If this matches the existing cluster, make it the default
+        if [[ "$name" == "$existing" ]]; then
+            default_selection=$i
+        fi
+        
+        if [[ "$type" == "Private" ]]; then
+            printf "  %2d) %-14s %s [Private]\n" "$i" "$name" "$url" >&2
+        else
+            printf "  %2d) %-14s %s\n" "$i" "$name" "$url" >&2
+        fi
+        ((i++))
+    done < <(list_clusters)
+    
+    echo "   c) Custom URL" >&2
+    echo "" >&2
+    
+    local selection
+    read -r -p "Enter selection [$default_selection]: " selection
+    selection="${selection:-$default_selection}"
+    
+    if [[ "$selection" == "c" || "$selection" == "C" ]]; then
+        local custom_url
+        read -r -p "Enter custom cluster URL: " custom_url
+        echo "$custom_url"
+    elif [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#clusters[@]} )); then
+        echo "${clusters[$((selection-1))]}"
+    else
+        log_error "Invalid selection"
+        exit "$EXIT_ERROR"
+    fi
+}
+
+# Prompt for a config value
+# Usage: prompt_value <prompt> [default] [required]
+prompt_value() {
+    local prompt="$1"
+    local default="${2:-}"
+    local required="${3:-false}"
+    local value
+    
+    if [[ -n "$default" ]]; then
+        read -r -p "$prompt [$default]: " value
+        value="${value:-$default}"
+    else
+        read -r -p "$prompt: " value
+    fi
+    
+    if [[ "$required" == "true" && -z "$value" ]]; then
+        log_error "This field is required."
+        exit "$EXIT_ERROR"
+    fi
+    
+    echo "$value"
+}
+
+interactive_config() {
+    local profile="$1"
+    local force_edit="${2:-false}"
+    local existing_cluster="" existing_customer_id="" existing_client_id=""
+    local existing_client_secret="" existing_access_token="" existing_refresh_token=""
+    local existing_ssh_user="" existing_ssh_password=""
+    local is_first_profile=false
+    
+    # Check if this is the first profile being created
+    local existing_profiles
+    existing_profiles=$(list_profiles)
+    if [[ -z "$existing_profiles" ]]; then
+        is_first_profile=true
+    fi
+    
+    # If profile exists and user didn't explicitly specify it, ask what to do
+    if profile_exists "$profile" && [[ "$force_edit" != "true" ]]; then
+        echo ""
+        echo "'$profile' is currently the active profile."
+        echo ""
+        echo "To view:       $SCRIPT_NAME config --show"
+        echo "To edit:       $SCRIPT_NAME config --profile $profile"
+        echo "To list all:   $SCRIPT_NAME config --list"
+        echo ""
+        read -r -p "Create a new profile? Enter name (or press Enter to cancel): " new_profile_name
+        
+        if [[ -z "$new_profile_name" ]]; then
+            echo "Cancelled."
+            return
+        fi
+        
+        # Recurse with the new profile name
+        interactive_config "$new_profile_name" "false"
+        return
+    fi
+    
+    echo ""
+    echo "Configuring profile: $profile"
+    
+    # Load existing values if profile exists (for editing)
+    if profile_exists "$profile"; then
+        existing_cluster=$(read_ini_value "$CONFIG_FILE" "$profile" "cluster")
+        existing_customer_id=$(read_ini_value "$CONFIG_FILE" "$profile" "customer_id")
+        existing_client_id=$(read_ini_value "$CONFIG_FILE" "$profile" "client_id")
+        existing_client_secret=$(read_ini_value "$CONFIG_FILE" "$profile" "client_secret")
+        existing_access_token=$(read_ini_value "$CONFIG_FILE" "$profile" "access_token")
+        existing_refresh_token=$(read_ini_value "$CONFIG_FILE" "$profile" "refresh_token")
+        existing_ssh_user=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_user")
+        existing_ssh_password=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_password")
+    fi
+    
+    # Select cluster
+    local cluster
+    cluster=$(select_cluster "$existing_cluster")
+    
+    # Prompt for other values
+    local customer_id client_id client_secret access_token refresh_token ssh_user ssh_password
+    
+    customer_id=$(prompt_value "Customer ID" "$existing_customer_id" "true")
+    client_id=$(prompt_value "Client ID" "$existing_client_id" "true")
+    client_secret=$(prompt_value "Client Secret" "$existing_client_secret" "true")
+    access_token=$(prompt_value "Access Token" "$existing_access_token" "true")
+    refresh_token=$(prompt_value "Refresh Token" "$existing_refresh_token" "true")
+    ssh_user=$(prompt_value "SSH Username" "${existing_ssh_user:-$DEFAULT_SSH_USER}")
+    ssh_password=$(prompt_value "SSH Password (optional, Enter to skip)" "$existing_ssh_password")
+    
+    # Save profile
+    write_ini_value "$CONFIG_FILE" "$profile" "cluster" "$cluster"
+    write_ini_value "$CONFIG_FILE" "$profile" "customer_id" "$customer_id"
+    write_ini_value "$CONFIG_FILE" "$profile" "client_id" "$client_id"
+    write_ini_value "$CONFIG_FILE" "$profile" "client_secret" "$client_secret"
+    write_ini_value "$CONFIG_FILE" "$profile" "access_token" "$access_token"
+    write_ini_value "$CONFIG_FILE" "$profile" "refresh_token" "$refresh_token"
+    write_ini_value "$CONFIG_FILE" "$profile" "ssh_user" "$ssh_user"
+    write_ini_value "$CONFIG_FILE" "$profile" "ssh_password" "$ssh_password"
+    
+    echo ""
+    echo "Configuration saved."
+    
+    # If this is the first profile, automatically set it as default
+    if [[ "$is_first_profile" == true ]]; then
+        set_default_profile "$profile"
+        echo "Default profile set to: $profile"
+        return
+    fi
+    
+    # Ask to set as default if not already
+    local current_default
+    current_default=$(get_default_profile)
+    
+    if [[ "$current_default" != "$profile" ]]; then
+        local set_default
+        read -r -p "Set '$profile' as default profile? [y/N]: " set_default
+        if [[ "$set_default" =~ ^[Yy]$ ]]; then
+            set_default_profile "$profile"
+            echo "Default profile set to: $profile"
+        fi
+    fi
+}
+
+# Mask a sensitive values, showing only first 4 and last 4 characters
+mask_value() {
+    local value="$1"
+    local len=${#value}
+    
+    if [[ -z "$value" ]]; then
+        echo "(not set)"
+    elif [[ $len -le 8 ]]; then
+        echo "********"
+    else
+        echo "${value:0:4}$(printf '*%.0s' $(seq 1 $((len - 8))))${value: -4}"
+    fi
+}
+
+# Usage: show_config <profile> [unmask]
+show_config() {
+    local profile="$1"
+    local unmask="${2:-false}"
+    local default_profile
+    default_profile=$(get_default_profile)
+    
+    if ! profile_exists "$profile"; then
+        log_error "Profile '$profile' does not exist."
+        exit "$EXIT_CONFIG_ERROR"
+    fi
+    
+    local cluster customer_id client_id client_secret access_token refresh_token ssh_user ssh_password
+    cluster=$(read_ini_value "$CONFIG_FILE" "$profile" "cluster")
+    customer_id=$(read_ini_value "$CONFIG_FILE" "$profile" "customer_id")
+    client_id=$(read_ini_value "$CONFIG_FILE" "$profile" "client_id")
+    client_secret=$(read_ini_value "$CONFIG_FILE" "$profile" "client_secret")
+    access_token=$(read_ini_value "$CONFIG_FILE" "$profile" "access_token")
+    refresh_token=$(read_ini_value "$CONFIG_FILE" "$profile" "refresh_token")
+    ssh_user=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_user")
+    ssh_user="${ssh_user:-$DEFAULT_SSH_USER}"
+    ssh_password=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_password")
+    
+    local cluster_url
+    cluster_url=$(get_cluster_url "$cluster")
+    if [[ -z "$cluster_url" && "$cluster" == http* ]]; then
+        cluster_url="$cluster"
+    fi
+    
+    local ssh_timeout
+    ssh_timeout=$(get_ssh_timeout)
+    
+    echo ""
+    if [[ "$profile" == "$default_profile" ]]; then
+        echo "Profile: $profile (active)"
+    else
+        echo "Profile: $profile"
+    fi
+    
+    if [[ -n "$cluster_url" ]]; then
+        echo "Cluster:       $cluster ($cluster_url)"
+    else
+        echo "Cluster:       $cluster"
+    fi
+    echo "Customer ID:   ${customer_id:-(not set)}"
+    echo "Client ID:     ${client_id:-(not set)}"
+    
+    if [[ "$unmask" == "true" ]]; then
+        echo "Client Secret: ${client_secret:-(not set)}"
+        echo "Access Token:  ${access_token:-(not set)}"
+        echo "Refresh Token: ${refresh_token:-(not set)}"
+        echo "SSH Username:  $ssh_user"
+        echo "SSH Password:  ${ssh_password:-(not set)}"
+    else
+        echo "Client Secret: $(mask_value "$client_secret")"
+        echo "Access Token:  $(mask_value "$access_token")"
+        echo "Refresh Token: $(mask_value "$refresh_token")"
+        echo "SSH Username:  $ssh_user"
+        if [[ -n "$ssh_password" ]]; then
+            echo "SSH Password:  ********"
+        else
+            echo "SSH Password:  (not set)"
+        fi
+    fi
+    
+    echo "SSH Timeout:   ${ssh_timeout}s"
+    echo ""
+    echo "Config file: $CONFIG_FILE"
+    if [[ "$unmask" != "true" ]]; then
+        echo "Use --unmask to show sensitive values"
+    fi
+    echo ""
+}
+
+# List all profiles with indication of active
+cmd_config_list() {
+    local default_profile profiles
+    default_profile=$(get_default_profile)
+    profiles=$(list_profiles)
+    
+    if [[ -z "$profiles" ]]; then
+        echo ""
+        echo "No profiles configured."
+        echo "Run 'ap-hop config' to create one."
+        echo ""
+        return
+    fi
+    
+    echo ""
+    echo "Available profiles:"
+    
+    while read -r profile; do
+        if [[ "$profile" == "$default_profile" ]]; then
+            echo "  * $profile (active)"
+        else
+            echo "    $profile"
+        fi
+    done <<< "$profiles"
+    
+    echo ""
+}
+
+cmd_config() {
+    local show=false
+    local list=false
+    local unmask=false
+    local delete=false
+    local use_profile=""
+    local config_profile=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --show)
+                show=true
+                shift
+                ;;
+            --unmask)
+                unmask=true
+                shift
+                ;;
+            --list)
+                list=true
+                shift
+                ;;
+            --delete)
+                delete=true
+                shift
+                ;;
+            --use)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--use requires a profile name"
+                    exit "$EXIT_ERROR"
+                fi
+                use_profile="$2"
+                shift 2
+                ;;
+            --profile|-p)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--profile requires a profile name"
+                    exit "$EXIT_ERROR"
+                fi
+                config_profile="$2"
+                shift 2
+                ;;
+            --help|-h)
+                show_config_help
+                exit "$EXIT_SUCCESS"
+                ;;
+            *)
+                log_error "Unknown config option: $1"
+                show_config_help
+                exit "$EXIT_ERROR"
+                ;;
+        esac
+    done
+    
+    # Handle --list
+    if [[ "$list" == true ]]; then
+        cmd_config_list
+        return
+    fi
+    
+    # Handle --delete (requires --profile)
+    if [[ "$delete" == true ]]; then
+        if [[ -z "$config_profile" ]]; then
+            log_error "--delete requires --profile <name>"
+            exit "$EXIT_ERROR"
+        fi
+        
+        if ! profile_exists "$config_profile"; then
+            log_error "Profile '$config_profile' does not exist."
+            exit "$EXIT_CONFIG_ERROR"
+        fi
+        
+        # Check if it's the active profile
+        local current_default
+        current_default=$(get_default_profile)
+        
+        if [[ "$config_profile" == "$current_default" ]]; then
+            log_error "Cannot delete the active profile."
+            log_error "Use '$SCRIPT_NAME config --use <other_profile>' to switch first."
+            exit "$EXIT_ERROR"
+        fi
+        
+        # Confirm deletion
+        local confirm
+        read -r -p "Delete profile '$config_profile'? [y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            return
+        fi
+        
+        delete_ini_section "$CONFIG_FILE" "$config_profile"
+        echo "Profile '$config_profile' deleted."
+        return
+    fi
+    
+    # Handle --use
+    if [[ -n "$use_profile" ]]; then
+        if ! profile_exists "$use_profile"; then
+            log_error "Profile '$use_profile' does not exist."
+            exit "$EXIT_CONFIG_ERROR"
+        fi
+        set_default_profile "$use_profile"
+        echo "Default profile set to: $use_profile"
+        return
+    fi
+    
+    # Determine which profile to work with and whether user explicitly specified it
+    local target_profile
+    local explicit_profile=false
+    if [[ -n "$config_profile" ]]; then
+        target_profile="$config_profile"
+        explicit_profile=true
+    elif [[ -n "$PROFILE" ]]; then
+        target_profile="$PROFILE"
+        explicit_profile=true
+    else
+        target_profile=$(get_default_profile)
+    fi
+    
+    # Handle --show
+    if [[ "$show" == true ]]; then
+        show_config "$target_profile" "$unmask"
+        return
+    fi
+    
+    # Default: interactive configuration
+    # Pass explicit_profile so we know if user wants to edit an existing profile
+    interactive_config "$target_profile" "$explicit_profile"
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# MAC address functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Accepts: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff
+validate_mac() {
+    local mac="$1"
+    
+    # Remove separators and convert to lowercase
+    local clean_mac
+    clean_mac=$(echo "$mac" | tr -d ':.-' | tr '[:upper:]' '[:lower:]')
+    
+    # Check if it's 12 hex characters
+    if [[ ! "$clean_mac" =~ ^[0-9a-f]{12}$ ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Normalize MAC address to lowercase colon-separated format
+normalize_mac() {
+    local mac="$1"
+    
+    # Remove separators and convert to lowercase
+    local clean_mac
+    clean_mac=$(echo "$mac" | tr -d ':.-' | tr '[:upper:]' '[:lower:]')
+    
+    # Insert colons
+    echo "$clean_mac" | sed 's/\(..\)/\1:/g' | sed 's/:$//'
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# OAuth2 functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Returns: 0 on success, 1 on failure
+# Sets: NEW_ACCESS_TOKEN, NEW_REFRESH_TOKEN
+refresh_access_token() {
+    local url="$CLUSTER_URL/oauth2/token"
+    
+    log_verbose "Refreshing access token..."
+    
+    local payload
+    payload=$(jq -n \
+        --arg client_id "$CLIENT_ID" \
+        --arg client_secret "$CLIENT_SECRET" \
+        --arg refresh_token "$REFRESH_TOKEN" \
+        '{
+            client_id: $client_id,
+            client_secret: $client_secret,
+            grant_type: "refresh_token",
+            refresh_token: $refresh_token
+        }')
+    
+    local response http_code
+    response=$(curl -s -w "\n%{http_code}" \
+        -X POST "$url" \
+        -H "Authorization: Bearer $ACCESS_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$payload")
+    
+    http_code=$(echo "$response" | tail -n1)
+    response=$(echo "$response" | sed '$d')
+    
+    if [[ "$http_code" != "200" ]]; then
+        log_error "Token refresh failed (HTTP $http_code)"
+        log_verbose "Response: $response"
+        return 1
+    fi
+    
+    NEW_ACCESS_TOKEN=$(echo "$response" | jq -r '.access_token // empty')
+    NEW_REFRESH_TOKEN=$(echo "$response" | jq -r '.refresh_token // empty')
+    
+    if [[ -z "$NEW_ACCESS_TOKEN" ]]; then
+        log_error "Token refresh response missing access_token"
+        log_verbose "Response: $response"
+        return 1
+    fi
+    
+    return 0
+}
+
+update_tokens() {
+    local profile="$1"
+    local access_token="$2"
+    local refresh_token="$3"
+    
+    write_ini_value "$CONFIG_FILE" "$profile" "access_token" "$access_token"
+    if [[ -n "$refresh_token" ]]; then
+        write_ini_value "$CONFIG_FILE" "$profile" "refresh_token" "$refresh_token"
+    fi
+    
+    # Update global variables
+    ACCESS_TOKEN="$access_token"
+    if [[ -n "$refresh_token" ]]; then
+        REFRESH_TOKEN="$refresh_token"
+    fi
+    
+    log_verbose "Tokens updated in config"
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# API functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Usage: api_get <endpoint> [retry_on_401]
+# Returns: JSON response or exits on error
+api_get() {
+    local endpoint="$1"
+    local retry_on_401="${2:-true}"
+    local url="$CLUSTER_URL$endpoint"
+    local max_retries=3
+    local retry_count=0
+    
+    while true; do
+        local headers=(-H "Authorization: Bearer $ACCESS_TOKEN" \
+                       -H "Content-Type: application/json" \
+                       -H "cache-control: no-cache")
+        
+        log_verbose "GET $url"
+        
+        local response http_code
+        response=$(curl -s -w "\n%{http_code}" -X GET "$url" "${headers[@]}")
+        http_code=$(echo "$response" | tail -n1)
+        response=$(echo "$response" | sed '$d')
+        
+        log_verbose "HTTP $http_code"
+        
+        # Handle 401 - token refresh
+        if [[ "$http_code" == "401" && "$retry_on_401" == "true" ]]; then
+            log_verbose "Received 401, attempting token refresh..."
+            
+            if refresh_access_token; then
+                update_tokens "$CURRENT_PROFILE" "$NEW_ACCESS_TOKEN" "$NEW_REFRESH_TOKEN"
+                log_verbose "Token refreshed, retrying request..."
+                retry_on_401="false"  # Only retry once
+                continue
+            else
+                log_error "Authentication failed. Check your credentials or run 'ap-hop config' to reconfigure."
+                exit "$EXIT_API_ERROR"
+            fi
+        fi
+        
+        # Handle 429 - rate limit
+        if [[ "$http_code" == "429" ]]; then
+            ((retry_count++))
+            if [[ $retry_count -ge $max_retries ]]; then
+                log_error "Rate limit exceeded. Please try again later."
+                exit "$EXIT_API_ERROR"
+            fi
+            log_verbose "Rate limited, waiting 1 second... (attempt $retry_count/$max_retries)"
+            sleep 1
+            continue
+        fi
+        
+        # Handle other errors
+        if [[ "$http_code" != "200" ]]; then
+            echo "$response"
+            return "$http_code"
+        fi
+        
+        echo "$response"
+        return 0
+    done
+}
+
+# Returns: JSON response or exits on error
+get_client_by_mac() {
+    local mac="$1"
+    local endpoint="/monitoring/v2/clients/$mac"
+    
+    api_get "$endpoint"
+}
+
+# Returns: JSON response or exits on error
+get_ap_by_serial() {
+    local serial="$1"
+    local endpoint="/monitoring/v1/aps/$serial"
+    
+    api_get "$endpoint"
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# SSH functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Get SSH password from config, env, or prompt
+get_ssh_password() {
+    # Check config
+    if [[ -n "$SSH_PASSWORD" ]]; then
+        echo "$SSH_PASSWORD"
+        return
+    fi
+    
+    # Check environment variable
+    if [[ -n "${ARUBA_SSH_PASSWORD:-}" ]]; then
+        echo "$ARUBA_SSH_PASSWORD"
+        return
+    fi
+    
+    # Prompt user
+    local password
+    read -r -s -p "SSH Password: " password
+    echo >&2  # Newline after password prompt
+    echo "$password"
+}
+
+ssh_to_ap() {
+    local ip="$1"
+    local password="$2"
+    local timeout
+    timeout=$(get_ssh_timeout)
+    
+    log_info "Connecting..."
+    log_verbose "sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$timeout -o LogLevel=ERROR $SSH_USER@$ip"
+    
+    local ssh_exit_code
+    SSHPASS="$password" sshpass -e ssh \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout="$timeout" \
+        -o LogLevel=ERROR \
+        "$SSH_USER@$ip"
+    ssh_exit_code=$?
+    
+    # sshpass exit code 5 = invalid/incorrect password
+    if [[ $ssh_exit_code -eq 5 ]]; then
+        log_error "SSH authentication failed. Is the password correct?"
+        log_error "Update with: $SCRIPT_NAME config --profile $CURRENT_PROFILE"
+    fi
+    
+    return $ssh_exit_code
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Main workflow
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+cmd_mac() {
+    local mac="$1"
+    
+    if ! validate_mac "$mac"; then
+        log_error "Invalid MAC address format: $mac"
+        log_error "Accepted formats: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff"
+        exit "$EXIT_VALIDATION_ERROR"
+    fi
+    
+    local normalized_mac
+    normalized_mac=$(normalize_mac "$mac")
+    
+    CURRENT_PROFILE="${PROFILE:-$(get_default_profile)}"
+    
+    load_profile "$CURRENT_PROFILE"
+    
+    log_verbose "Using profile: $CURRENT_PROFILE"
+    log_verbose "Cluster: $CLUSTER ($CLUSTER_URL)"
+    
+    log_info ""
+    log_info "Looking up client $normalized_mac..."
+    
+    local client_response
+    local client_exit_code
+    client_response=$(get_client_by_mac "$normalized_mac") && client_exit_code=0 || client_exit_code=$?
+    
+    # Handle 404 - client not found (exit code 148 = 404 mod 256)
+    if [[ $client_exit_code -eq 148 ]] || [[ $client_exit_code -eq 404 ]]; then
+        log_error "client not found"
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    # Handle other non-success responses
+    if [[ $client_exit_code -ne 0 ]]; then
+        if ! is_valid_json "$client_response"; then
+            log_error "API request failed - invalid response from server"
+            log_verbose "Response: $client_response"
+        elif echo "$client_response" | jq -e '.error' &>/dev/null; then
+            local error_msg
+            error_msg=$(echo "$client_response" | jq -r '.error // "Unknown error"')
+            log_error "API error: $error_msg"
+        else
+            log_error "API request failed (HTTP $client_exit_code)"
+            log_verbose "Response: $client_response"
+        fi
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    # Check if response is valid JSON
+    if ! is_valid_json "$client_response"; then
+        log_error "API returned invalid response"
+        log_verbose "Response: $client_response"
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    # Check for error in response (only .error field indicates an API error)
+    if echo "$client_response" | jq -e '.error' &>/dev/null 2>&1; then
+        local error_msg
+        error_msg=$(echo "$client_response" | jq -r '.error // "Unknown error"')
+        log_error "API error: $error_msg"
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    # Display verbose client details (raw JSON)
+    if [[ "$VERBOSE" == true ]]; then
+        echo ""
+        echo "Client Response:"
+        echo "$client_response" | jq .
+    fi
+    
+    # Extract AP serial
+    local ap_serial
+    ap_serial=$(echo "$client_response" | jq -r '.associated_device // empty')
+    
+    if [[ -z "$ap_serial" ]]; then
+        log_error "Client found but no associated AP"
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    log_verbose ""
+    log_verbose "Looking up AP $ap_serial..."
+    
+    # Look up AP
+    local ap_response
+    if ! ap_response=$(get_ap_by_serial "$ap_serial"); then
+        if ! is_valid_json "$ap_response"; then
+            log_error "Failed to look up AP $ap_serial - invalid response from server"
+            log_verbose "Response: $ap_response"
+        else
+            log_error "Failed to look up AP $ap_serial"
+            log_verbose "Response: $ap_response"
+        fi
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    # Check if response is valid JSON
+    if ! is_valid_json "$ap_response"; then
+        log_error "AP lookup returned invalid response"
+        log_verbose "Response: $ap_response"
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    # Check for error in response (only .error field indicates an API error)
+    if echo "$ap_response" | jq -e '.error' &>/dev/null 2>&1; then
+        local error_msg
+        error_msg=$(echo "$ap_response" | jq -r '.error // "Unknown error"')
+        log_error "AP lookup failed: $error_msg"
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    # Display verbose AP details (raw JSON)
+    if [[ "$VERBOSE" == true ]]; then
+        echo ""
+        echo "AP Response:"
+        echo "$ap_response" | jq .
+    fi
+    
+    # Extract AP info
+    local ap_name ap_mac ap_ip ap_status down_reason
+    ap_name=$(echo "$ap_response" | jq -r '.name // "Unknown"')
+    ap_mac=$(echo "$ap_response" | jq -r '.macaddr // "Unknown"')
+    ap_ip=$(echo "$ap_response" | jq -r '.ip_address // empty')
+    ap_status=$(echo "$ap_response" | jq -r '.status // "Unknown"')
+    down_reason=$(echo "$ap_response" | jq -r '.down_reason // ""')
+    
+    if [[ -z "$ap_ip" ]]; then
+        log_error "AP found but no IP address available"
+        exit "$EXIT_API_ERROR"
+    fi
+    
+    # Print AP summary
+    log_info "Client found on AP: $ap_name ($ap_mac) at $ap_ip"
+    
+    # Warn if AP is down
+    if [[ "$ap_status" == "Down" ]]; then
+        log_info "WARNING: AP status is 'Down' (Reason: ${down_reason:-Unknown})"
+        log_info "Attempting SSH anyway..."
+    fi
+    
+    # Dry run check
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "Dry run - not connecting. Would SSH to $SSH_USER@$ap_ip"
+        exit "$EXIT_SUCCESS"
+    fi
+    
+    # Get SSH password
+    local password
+    password=$(get_ssh_password)
+    
+    if [[ -z "$password" ]]; then
+        log_error "No SSH password provided"
+        exit "$EXIT_SSH_ERROR"
+    fi
+    
+    # SSH to AP
+    if ! ssh_to_ap "$ap_ip" "$password"; then
+        exit "$EXIT_SSH_ERROR"
+    fi
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Help functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+show_help() {
+    cat << EOF
+$SCRIPT_NAME v$VERSION - Aruba Central Client-to-AP SSH tool
+
+Quickly "hop" into the access point serving a wireless client by providing
+only the client's MAC address.
+
+USAGE:
+    $SCRIPT_NAME [OPTIONS] <mac_address>
+    $SCRIPT_NAME config [CONFIG_OPTIONS]
+
+ARGUMENTS:
+    <mac_address>       Client MAC address (aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, or aabbccddeeff)
+
+OPTIONS:
+    -p, --profile <name>    Use specified profile instead of default
+    -v, --verbose           Show raw JSON API responses
+    -n, --dry-run           Query API and show results without connecting via SSH
+    -h, --help              Show this help message
+    --version               Show version
+
+CONFIG SUBCOMMAND:
+    $SCRIPT_NAME config                          Interactive setup
+    $SCRIPT_NAME config --profile <name>         Configure named profile
+    $SCRIPT_NAME config --show                   Show active profile
+    $SCRIPT_NAME config --list                   List all profiles
+    $SCRIPT_NAME config --use <name>             Set default profile
+    $SCRIPT_NAME config --delete --profile <name>   Delete a profile
+
+EXAMPLES:
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff
+    $SCRIPT_NAME --verbose aabbccddeeff
+    $SCRIPT_NAME --profile production aa-bb-cc-dd-ee-ff
+    $SCRIPT_NAME --dry-run aa:bb:cc:dd:ee:ff
+    $SCRIPT_NAME config
+    $SCRIPT_NAME config --use production
+
+ENVIRONMENT VARIABLES:
+    ARUBA_SSH_PASSWORD      SSH password (if not in config)
+    XDG_CONFIG_HOME         Config directory base (default: ~/.config)
+
+FILES:
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/config     Profile configuration
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/clusters   Cluster URL definitions
+
+EOF
+}
+
+show_config_help() {
+    cat << EOF
+$SCRIPT_NAME config - Manage profile configuration
+
+USAGE:
+    $SCRIPT_NAME config [OPTIONS]
+
+OPTIONS:
+    --profile <name>, -p    Specify profile to operate on
+    --show                  Show profile configuration (secrets masked)
+    --unmask                Show sensitive values when used with --show
+    --list                  List all available profiles
+    --use <name>            Set the default profile
+    --delete                Delete profile (requires --profile)
+    -h, --help              Show this help message
+
+EXAMPLES:
+    $SCRIPT_NAME config                              # Interactive setup
+    $SCRIPT_NAME config --profile production         # Configure 'production' profile
+    $SCRIPT_NAME config --show                       # Show active profile (masked)
+    $SCRIPT_NAME config --show --unmask              # Show active profile (unmasked)
+    $SCRIPT_NAME config --show --profile prod        # Show 'prod' profile
+    $SCRIPT_NAME config --list                       # List all profiles
+    $SCRIPT_NAME config --use production             # Set 'production' as default
+    $SCRIPT_NAME config --delete --profile old       # Delete 'old' profile
+
+EOF
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Main
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+main() {
+    # Parse global options (stop at first positional argument)
+    local positional_args=()
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--profile)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--profile requires a profile name"
+                    exit "$EXIT_ERROR"
+                fi
+                PROFILE="$2"
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit "$EXIT_SUCCESS"
+                ;;
+            --version)
+                echo "$SCRIPT_NAME v$VERSION"
+                exit "$EXIT_SUCCESS"
+                ;;
+            --)
+                shift
+                positional_args+=("$@")
+                break
+                ;;
+            -*)
+                # Unknown option - might be for subcommand, collect remaining args
+                positional_args+=("$@")
+                break
+                ;;
+            *)
+                # First positional argument found - collect it and all remaining args
+                positional_args+=("$@")
+                break
+                ;;
+        esac
+    done
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Ensure config directory and files exist
+    ensure_config_dir
+    ensure_clusters_file
+    ensure_config_file
+    
+    # Handle subcommands or MAC address
+    if [[ ${#positional_args[@]} -eq 0 ]]; then
+        show_help
+        exit "$EXIT_SUCCESS"
+    fi
+    
+    local first_arg="${positional_args[0]}"
+    
+    if [[ "$first_arg" == "config" ]]; then
+        # Config subcommand
+        cmd_config "${positional_args[@]:1}"
+    elif validate_mac "$first_arg"; then
+        # MAC address provided - parse any remaining options
+        local remaining_args=("${positional_args[@]:1}")
+        for arg in "${remaining_args[@]}"; do
+            case "$arg" in
+                -v|--verbose)
+                    VERBOSE=true
+                    ;;
+                -n|--dry-run)
+                    DRY_RUN=true
+                    ;;
+                -*)
+                    log_error "Unknown option: $arg"
+                    exit "$EXIT_ERROR"
+                    ;;
+            esac
+        done
+        cmd_mac "$first_arg"
+    else
+        log_error "Invalid MAC address: $first_arg"
+        log_error "Accepted formats: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff"
+        exit "$EXIT_VALIDATION_ERROR"
+    fi
+}
+
+main "$@"
