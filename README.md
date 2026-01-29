@@ -7,25 +7,36 @@ SSH into a New Central managed Aruba AP by client MAC or AP BSSID. That's it.
 ## Install
 
 ```bash
-curl -o ~/.local/bin/ap-hop https://raw.githubusercontent.com/joshschmelzle/ap-hop/main/ap-hop
-chmod +x ~/.local/bin/ap-hop
+curl -fsSL https://wifi.lol/ap-hop | bash
 ```
 
-Yes, we're curling bash scripts from the internet. This is the way.
+The installer will:
+- Check for required dependencies (`curl`, `jq`, `sshpass`)
+- Download `ap-hop` to `~/.local/bin/`
+- Add `~/.local/bin` to your PATH if needed
+- Tell you what to do next
+
+Yes, we're curling bash scripts from the Internet. This is the way.
 
 ## Setup
 
-Generate API client: https://common.cloud.hpe.com/manage-account/api
+Generate API client for the service (cluster) where your APs are: https://common.cloud.hpe.com/manage-account/api
+
+You need the client ID and secret.
+
+```bash
+ap-hop
+```
+
+On first run without a profile, a config wizard will ask you questions. It only asks once.
 
 ```bash
 ap-hop config
 ```
 
-The config wizard will ask you questions. Answer them honestly. It only asks once.
-
 ## Use
 
-Use your own Wi-Fi MAC:
+Your own Wi-Fi MAC:
 
 ```bash
 ap-hop
@@ -51,11 +62,13 @@ ap-hop --help
 
 For when you forget everything.
 
-## Requirements
+## Dependencies
 
 `curl`, `jq`, `sshpass`. You probably have two of these.
 
 Should work on Linux and macOS.
+
+ - brew install sshpass jq
 
 Windows users: Good news! WSL2 lets you pretend you're on a real operating system.
 
