@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# ap-hop - Aruba Central Client-to-AP SSH tool
+# ap-hop - Aruba New Central "Jump-to-AP" SSH tool
 #
-# Quickly "hop" into the access point serving a wireless client
+# Quickly "hop" into the access point by providing a client MAC or AP BSSID
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 set -euo pipefail
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Constants
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Constants
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-readonly VERSION="0.0.1"
+readonly VERSION="0.0.2"
 readonly SCRIPT_NAME="ap-hop"
 readonly DEFAULT_SSH_USER="admin"
 readonly DEFAULT_SSH_TIMEOUT=10
@@ -25,25 +24,25 @@ readonly EXIT_VALIDATION_ERROR=5
 readonly EXIT_DEPENDENCY_ERROR=6
 
 # Order matters for menu display
-readonly DEFAULT_CLUSTERS='# Aruba Central API Gateway Clusters
+readonly DEFAULT_CLUSTERS='# Aruba New Central API Gateway Clusters
 # Format: NAME|URL|TYPE
 # Lines starting with # are comments
 # Order determines menu display order
-Internal|https://internal-apigw.central.arubanetworks.com|Private
-Canada-1|https://apigw-ca.central.arubanetworks.com|Public
-US-West5|https://apigw-uswest5.central.arubanetworks.com|Public
-US-West4|https://apigw-uswest4.central.arubanetworks.com|Public
-US-East1|https://apigw-us-east-1.central.arubanetworks.com|Public
-US-1|https://app1-apigw.central.arubanetworks.com|Public
-US-2|https://apigw-prod2.central.arubanetworks.com|Public
-APAC-1|https://api-ap.central.arubanetworks.com|Public
-APAC-East1|https://apigw-apaceast.central.arubanetworks.com|Public
-APAC-South1|https://apigw-apacsouth.central.arubanetworks.com|Public
-EU-1|https://eu-apigw.central.arubanetworks.com|Public
-EU-Central2|https://apigw-eucentral2.central.arubanetworks.com|Public
-EU-Central3|https://apigw-eucentral3.central.arubanetworks.com|Public
-China-1|https://apigw.central.arubanetworks.com.cn|Public
-UAE-North1|https://apigw-uaenorth1.central.arubanetworks.com|Public'
+Internal2|https://internal.api.central.arubanetworks.com|Private
+EU-1|https://de1.api.central.arubanetworks.com|Public
+EU-Central2|https://de2.api.central.arubanetworks.com|Public
+EU-Central3|https://de3.api.central.arubanetworks.com|Public
+UK-West2|https://gb1.api.central.arubanetworks.com|Public
+US-1|https://us1.api.central.arubanetworks.com|Public
+US-2|https://us2.api.central.arubanetworks.com|Public
+US-West4|https://us4.api.central.arubanetworks.com|Public
+US-West5|https://us5.api.central.arubanetworks.com|Public
+US-East1|https://us6.api.central.arubanetworks.com|Public
+Canada-1|https://ca1.api.central.arubanetworks.com|Public
+APAC-1|https://in.api.central.arubanetworks.com|Public
+APAC-East1|https://jp1.api.central.arubanetworks.com|Public
+APAC-South1|https://au1.api.central.arubanetworks.com|Public
+UAE-North1|https://ae1.api.central.arubanetworks.com|Public'
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Global variables
@@ -56,6 +55,17 @@ CONFIG_DIR=""
 CONFIG_FILE=""
 CLUSTERS_FILE=""
 SSH_USER=""
+SITE_FILTER=""
+SITE_ID_FILTER=""
+VERIFY_AP_STATUS=false
+AP_NAME=""
+AP_MAC=""
+AP_IP=""
+LIST_SITES=false
+REFRESH_SITES=false
+LIST_APS=false
+REFRESH_APS=false
+SHOW_ALL_SITES=false
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Utility functions
@@ -82,13 +92,13 @@ log_verbose() {
 
 check_dependencies() {
     local missing=()
-    
+
     for cmd in curl jq sshpass; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
     done
-    
+
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Missing required dependencies: ${missing[*]}"
         log_error "Please install them and try again."
@@ -104,7 +114,7 @@ ensure_config_dir() {
     CONFIG_DIR="$(get_config_dir)"
     CONFIG_FILE="$CONFIG_DIR/config"
     CLUSTERS_FILE="$CONFIG_DIR/clusters"
-    
+
     if [[ ! -d "$CONFIG_DIR" ]]; then
         mkdir -p "$CONFIG_DIR"
         chmod 700 "$CONFIG_DIR"
@@ -119,7 +129,6 @@ ensure_clusters_file() {
     fi
 }
 
-# Ensure config file exists
 ensure_config_file() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         cat > "$CONFIG_FILE" << 'EOF'
@@ -132,19 +141,382 @@ EOF
 }
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Site cache functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+get_sites_cache_file() {
+    echo "$CONFIG_DIR/sites_cache"
+}
+
+is_sites_cache_valid() {
+    local cache_file
+    cache_file=$(get_sites_cache_file)
+
+    if [[ ! -f "$cache_file" ]]; then
+        return 1
+    fi
+
+    local cache_time current_time age
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        cache_time=$(stat -f %m "$cache_file" 2>/dev/null)
+    else
+        cache_time=$(stat -c %Y "$cache_file" 2>/dev/null)
+    fi
+    current_time=$(date +%s)
+    age=$((current_time - cache_time))
+
+    [[ $age -gt 86400 ]] && return 1 || return 0
+}
+
+fetch_and_cache_sites() {
+    local endpoint="/network-monitoring/v1alpha1/sites-health"
+
+    log_verbose "Fetching sites from API..."
+
+    local response
+    response=$(api_get "$endpoint") || {
+        log_error "Failed to fetch sites"
+        return 1
+    }
+
+    local cache_file
+    cache_file=$(get_sites_cache_file)
+
+    {
+        echo "# Sites cache - $(date)"
+        echo "# Format: SITE_ID|SITE_NAME|CLIENT_COUNT"
+        echo "$response" | jq -r '.items[] | "\(.id)|\(.name)|\(.clients.count)"'
+    } > "$cache_file"
+
+    local count
+    count=$(grep -c -v '^#' "$cache_file")
+    log_verbose "Cached $count sites"
+    return 0
+}
+
+load_cached_sites() {
+    local cache_file
+    cache_file=$(get_sites_cache_file)
+
+    if [[ ! -f "$cache_file" ]]; then
+        SITE_IDS=()
+        SITE_NAMES=()
+        SITE_CLIENT_COUNTS=()
+        return 1
+    fi
+
+    SITE_IDS=()
+    SITE_NAMES=()
+    SITE_CLIENT_COUNTS=()
+
+    while IFS='|' read -r site_id site_name client_count; do
+        [[ "$site_id" =~ ^# ]] && continue
+        SITE_IDS+=("$site_id")
+        SITE_NAMES+=("$site_name")
+        SITE_CLIENT_COUNTS+=("$client_count")
+    done < <(grep -v '^#' "$cache_file")
+
+    return 0
+}
+
+invalidate_sites_cache() {
+    rm -f "$(get_sites_cache_file)"
+    log_verbose "Sites cache invalidated"
+}
+
+find_site_by_name() {
+    local search_name="$1"
+
+    for ((i=0; i<${#SITE_NAMES[@]}; i++)); do
+        if [[ "${SITE_NAMES[$i]}" == "$search_name" ]]; then
+            echo "${SITE_IDS[$i]}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+find_site_by_id() {
+    local search_id="$1"
+
+    for ((i=0; i<${#SITE_IDS[@]}; i++)); do
+        if [[ "${SITE_IDS[$i]}" == "$search_id" ]]; then
+            echo "${SITE_NAMES[$i]}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Sets: SELECTED_SITE_ID, SELECTED_SITE_NAME, SELECTED_SITE_CLIENT_COUNT
+select_site() {
+    local filtered_indices=()
+    local hidden_count=0
+
+    if [[ -z "${SITE_IDS[*]:-}" ]] || [[ -z "${SITE_NAMES[*]:-}" ]] || [[ -z "${SITE_CLIENT_COUNTS[*]:-}" ]]; then
+        log_error "Site data not loaded properly"
+        exit "$EXIT_ERROR"
+    fi
+
+    for ((i=0; i<${#SITE_IDS[@]}; i++)); do
+        if [[ "${SITE_CLIENT_COUNTS[$i]}" -gt 0 ]] || [[ "$SHOW_ALL_SITES" == true ]]; then
+            filtered_indices+=("$i")
+        else
+            hidden_count=$((hidden_count + 1))
+        fi
+    done
+
+    if [[ ${#filtered_indices[@]} -eq 1 ]] && [[ "$SHOW_ALL_SITES" != true ]]; then
+        local idx="${filtered_indices[0]}"
+        SELECTED_SITE_ID="${SITE_IDS[$idx]}"
+        SELECTED_SITE_NAME="${SITE_NAMES[$idx]}"
+        SELECTED_SITE_CLIENT_COUNT="${SITE_CLIENT_COUNTS[$idx]}"
+        log_info "Auto-selected site: $SELECTED_SITE_NAME (${SITE_CLIENT_COUNTS[$idx]} clients)" >&2
+        return
+    fi
+
+    if [[ ${#filtered_indices[@]} -eq 0 ]]; then
+        log_error "No sites with clients found. Use --all to see all sites or refresh the cache."
+        exit "$EXIT_ERROR"
+    fi
+
+    echo "" >&2
+    echo "Select site to search:" >&2
+    echo "" >&2
+
+    for ((j=0; j<${#filtered_indices[@]}; j++)); do
+        local orig_idx="${filtered_indices[$j]}"
+        printf "  %2d) %-35s (%3d clients)\n" \
+            "$((j+1))" "${SITE_NAMES[$orig_idx]}" "${SITE_CLIENT_COUNTS[$orig_idx]}" >&2
+    done
+
+    echo "   r) Refresh site cache" >&2
+
+    if [[ $hidden_count -gt 0 ]]; then
+        echo "" >&2
+        echo "Note: $hidden_count sites have 0 clients (use --all to show or refresh the site cache)" >&2
+    fi
+
+    echo "" >&2
+
+    local selection
+    read -r -p "Enter selection: " selection
+
+    if [[ "$selection" =~ ^[Rr]$ ]]; then
+        SELECTED_SITE_ID="__REFRESH__"
+        return
+    fi
+
+    if [[ ! "$selection" =~ ^[0-9]+$ ]] || \
+       (( selection < 1 || selection > ${#filtered_indices[@]} )); then
+        log_error "Invalid selection"
+        exit "$EXIT_ERROR"
+    fi
+
+    local filtered_idx=$((selection - 1))
+    local orig_idx="${filtered_indices[$filtered_idx]}"
+    SELECTED_SITE_ID="${SITE_IDS[$orig_idx]}"
+    SELECTED_SITE_NAME="${SITE_NAMES[$orig_idx]}"
+    SELECTED_SITE_CLIENT_COUNT="${SITE_CLIENT_COUNTS[$orig_idx]}"
+}
+
+sanitize_site_name() {
+    local site_name="$1"
+    echo "$site_name" | tr ' ' '_' | sed 's/[^a-zA-Z0-9_-]//g'
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# AP cache functions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+get_aps_cache_file() {
+    local site_id="$1"
+    local site_name="$2"
+    local sanitized
+    sanitized=$(sanitize_site_name "$site_name")
+    echo "$CONFIG_DIR/aps_cache_${sanitized}"
+}
+
+is_aps_cache_valid() {
+    local site_id="$1"
+    local site_name="$2"
+    local cache_file
+    cache_file=$(get_aps_cache_file "$site_id" "$site_name")
+
+    [[ ! -f "$cache_file" ]] && return 1
+
+    local cache_time current_time age
+    # Get modification time in epoch format (cross-platform)
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        cache_time=$(stat -f %m "$cache_file" 2>/dev/null)
+    else
+        cache_time=$(stat -c %Y "$cache_file" 2>/dev/null)
+    fi
+    current_time=$(date +%s)
+    age=$((current_time - cache_time))
+
+    [[ $age -gt 86400 ]] && return 1 || return 0
+}
+
+invalidate_aps_cache() {
+    local site_id="$1"
+    local site_name="$2"
+    rm -f "$(get_aps_cache_file "$site_id" "$site_name")"
+    log_verbose "AP cache invalidated for site: $site_name"
+}
+
+fetch_and_cache_aps() {
+    local site_id="$1"
+    local site_name="$2"
+    local cache_file
+    cache_file=$(get_aps_cache_file "$site_id" "$site_name")
+    local max_aps="${MAX_APS_PER_SITE:-1000}"
+
+    log_info "Building AP cache for '$site_name'..."
+
+    local all_aps=""
+    local offset=0
+    local limit=100
+    local total_fetched=0
+
+    while true; do
+        local endpoint="/network-monitoring/v1alpha1/aps?site-id=${site_id}&limit=${limit}&offset=${offset}"
+        local response
+        response=$(api_get "$endpoint") || {
+            log_error "Failed to fetch APs for site"
+            return 1
+        }
+
+        local online_aps
+        online_aps=$(echo "$response" | jq -r '.items[] | select(.status == "ONLINE") | .serialNumber')
+
+        if [[ -z "$online_aps" ]]; then
+            break
+        fi
+
+        all_aps="${all_aps}${online_aps}"$'\n'
+        total_fetched=$((total_fetched + $(echo "$online_aps" | wc -l | xargs)))
+
+        local next
+        next=$(echo "$response" | jq -r '.next // empty')
+        if [[ -z "$next" ]] || [[ $total_fetched -ge $max_aps ]]; then
+            break
+        fi
+
+        offset=$((offset + limit))
+    done
+
+    all_aps=$(echo "$all_aps" | grep -v '^$')
+    local ap_count
+    ap_count=$(echo "$all_aps" | wc -l | xargs)
+
+    if [[ $ap_count -eq 0 ]]; then
+        log_error "No online APs found in site '$site_name'"
+        return 1
+    fi
+
+    log_info "Found $ap_count online APs, fetching details..."
+
+    local processed=0
+    local start_time
+    start_time=$(date +%s)
+
+    {
+        echo "# APs cache for site: $site_name - $(date)"
+        echo "# Format: SERIAL|NAME|MAC|IP|BSSID1,BSSID2,BSSID3,..."
+
+        while IFS= read -r serial; do
+            [[ -z "$serial" ]] && continue
+
+            local ap_response
+            ap_response=$(api_get "/network-monitoring/v1alpha1/aps/${serial}" 2>/dev/null) || {
+                log_verbose "Warning: Failed to fetch details for AP $serial"
+                processed=$((processed + 1))
+                continue
+            }
+
+            local name mac ip
+            name=$(echo "$ap_response" | jq -r '.deviceName // "Unknown"')
+            mac=$(echo "$ap_response" | jq -r '.macAddress // "Unknown"')
+            ip=$(echo "$ap_response" | jq -r '.ipv4 // empty')
+
+            [[ -z "$ip" ]] && {
+                log_verbose "Warning: AP $serial has no IP address, skipping"
+                processed=$((processed + 1))
+                continue
+            }
+
+            local bssids
+            bssids=$(echo "$ap_response" | jq -r '[.radios[]? | .wlans[]? | .bssid] | join(",")')
+
+            echo "${serial}|${name}|${mac}|${ip}|${bssids}"
+
+            processed=$((processed + 1))
+
+            if (( processed % 10 == 0 )); then
+                echo "Progress: $processed/$ap_count APs cached..." >&2
+            fi
+
+        done <<< "$all_aps"
+    } > "$cache_file"
+
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+
+    local cached_count
+    cached_count=$(grep -c -v '^#' "$cache_file")
+
+    if [[ $cached_count -eq 0 ]]; then
+        log_error "Failed to cache any APs for site '$site_name'"
+        rm -f "$cache_file"
+        return 1
+    fi
+
+    if [[ $cached_count -lt $ap_count ]]; then
+        log_info "Warning: Only cached $cached_count/$ap_count APs (some failed to fetch)"
+    fi
+
+    log_info "Cache built in ${duration}s ($cached_count APs cached)"
+    return 0
+}
+
+find_serial_by_bssid_cached() {
+    local bssid="$1"
+    local site_id="$2"
+    local site_name="$3"
+    local cache_file
+    cache_file=$(get_aps_cache_file "$site_id" "$site_name")
+    local normalized_bssid
+    normalized_bssid=$(normalize_mac "$bssid")
+
+    while IFS='|' read -r serial name mac ip bssids; do
+        [[ "$serial" =~ ^# ]] && continue
+
+        if echo ",$bssids," | grep -q ",${normalized_bssid},"; then
+            echo "${serial}|${name}|${mac}|${ip}"
+            return 0
+        fi
+    done < <(grep -v '^#' "$cache_file")
+
+    return 1
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # INI file functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Usage: read_ini_value <file> <section> <key>
 read_ini_value() {
     local file="$1"
     local section="$2"
     local key="$3"
-    
+
     if [[ ! -f "$file" ]]; then
         return 1
     fi
-    
+
     awk -F '=' -v section="$section" -v key="$key" '
         /^\[/ {
             current_section = substr($0, 2, length($0) - 2)
@@ -158,29 +530,26 @@ read_ini_value() {
     ' "$file"
 }
 
-# Usage: ini_section_exists <file> <section>
 ini_section_exists() {
     local file="$1"
     local section="$2"
-    
+
     if [[ ! -f "$file" ]]; then
         return 1
     fi
-    
+
     grep -q "^\[$section\]$" "$file"
 }
 
-# Write a value to INI file (creates section if needed)
-# Usage: write_ini_value <file> <section> <key> <value>
 write_ini_value() {
     local file="$1"
     local section="$2"
     local key="$3"
     local value="$4"
     local temp_file
-    
+
     temp_file=$(mktemp)
-    
+
     if [[ ! -f "$file" ]]; then
         echo "[$section]" > "$file"
         echo "$key=$value" >> "$file"
@@ -188,10 +557,8 @@ write_ini_value() {
         rm -f "$temp_file"
         return 0
     fi
-    
-    # Check if section exists
+
     if ! ini_section_exists "$file" "$section"; then
-        # Add new section at end of file
         cp "$file" "$temp_file"
         {
             echo ""
@@ -201,8 +568,7 @@ write_ini_value() {
         mv "$temp_file" "$file"
         return 0
     fi
-    
-    # Section exists - update or add key
+
     awk -v section="$section" -v key="$key" -v value="$value" '
         BEGIN { in_section = 0; key_found = 0 }
         /^\[/ {
@@ -224,29 +590,28 @@ write_ini_value() {
             }
         }
     ' "$file" > "$temp_file"
-    
+
     mv "$temp_file" "$file"
 }
 
-# Usage: delete_ini_section <file> <section>
 delete_ini_section() {
     local file="$1"
     local section="$2"
     local temp_file
-    
+
     if [[ ! -f "$file" ]]; then
         return 0
     fi
-    
+
     temp_file=$(mktemp)
-    
+
     awk -v section="$section" '
         /^\[/ {
             current_section = substr($0, 2, length($0) - 2)
         }
         current_section != section { print }
     ' "$file" > "$temp_file"
-    
+
     mv "$temp_file" "$file"
 }
 
@@ -271,12 +636,11 @@ get_ssh_timeout() {
     echo "${timeout:-$DEFAULT_SSH_TIMEOUT}"
 }
 
-# List all profile names (excluding _settings)
 list_profiles() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         return
     fi
-    
+
     grep '^\[' "$CONFIG_FILE" | sed 's/\[\(.*\)\]/\1/' | grep -v '^_settings$' || true
 }
 
@@ -288,60 +652,64 @@ profile_exists() {
 validate_profile() {
     local profile="$1"
     local missing=()
-    
-    for field in cluster customer_id client_id client_secret access_token refresh_token; do
+
+    for field in cluster client_id client_secret; do
         local value
         value=$(read_ini_value "$CONFIG_FILE" "$profile" "$field")
         if [[ -z "$value" ]]; then
             missing+=("$field")
         fi
     done
-    
+
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Profile '$profile' is missing required fields: ${missing[*]}"
         log_error "Run 'ap-hop config --profile $profile' to configure."
         return 1
     fi
-    
+
     return 0
 }
 
-# Load profile into variables
-# Sets: CLUSTER, CLUSTER_URL, CUSTOMER_ID, CLIENT_ID, CLIENT_SECRET, 
-#       ACCESS_TOKEN, REFRESH_TOKEN, SSH_PASSWORD, TENANT_ID
+# Sets: CLUSTER, CLUSTER_URL, CLIENT_ID, CLIENT_SECRET, ACCESS_TOKEN, TOKEN_TIMESTAMP, SSH_PASSWORD, SSH_USER
 load_profile() {
     local profile="$1"
-    
+
     if ! profile_exists "$profile"; then
         # Check if any profiles exist at all
         local existing_profiles
         existing_profiles=$(list_profiles)
         if [[ -z "$existing_profiles" ]]; then
-            log_error "No profiles configured."
-            log_error "Run 'ap-hop config' to create your first profile."
+            log_info "No profiles configured. Let's create your first profile."
+            echo ""
+            interactive_config "$profile" "true"
+            echo ""
+            log_info "Configuration complete! Continuing..."
+            echo ""
+            # Reload the profile after creation
+            load_profile "$profile"
+            return
         else
             log_error "Profile '$profile' does not exist."
             log_error "Run 'ap-hop config --profile $profile' to create it, or use --profile to specify an existing one."
+            exit "$EXIT_CONFIG_ERROR"
         fi
-        exit "$EXIT_CONFIG_ERROR"
     fi
-    
+
     if ! validate_profile "$profile"; then
         exit "$EXIT_CONFIG_ERROR"
     fi
-    
+
     CLUSTER=$(read_ini_value "$CONFIG_FILE" "$profile" "cluster")
-    # shellcheck disable=SC2034  
-    CUSTOMER_ID=$(read_ini_value "$CONFIG_FILE" "$profile" "customer_id")
     CLIENT_ID=$(read_ini_value "$CONFIG_FILE" "$profile" "client_id")
     CLIENT_SECRET=$(read_ini_value "$CONFIG_FILE" "$profile" "client_secret")
     ACCESS_TOKEN=$(read_ini_value "$CONFIG_FILE" "$profile" "access_token")
-    REFRESH_TOKEN=$(read_ini_value "$CONFIG_FILE" "$profile" "refresh_token")
+    TOKEN_TIMESTAMP=$(read_ini_value "$CONFIG_FILE" "$profile" "token_timestamp")
     SSH_PASSWORD=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_password")
     SSH_USER=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_user")
     SSH_USER="${SSH_USER:-$DEFAULT_SSH_USER}"
-    
-    # Resolve cluster URL
+    MAX_APS_PER_SITE=$(read_ini_value "$CONFIG_FILE" "$profile" "max_aps_per_site")
+    MAX_APS_PER_SITE="${MAX_APS_PER_SITE:-1000}"
+
     CLUSTER_URL=$(get_cluster_url "$CLUSTER")
     if [[ -z "$CLUSTER_URL" ]]; then
         if [[ "$CLUSTER" == http* ]]; then
@@ -359,11 +727,11 @@ load_profile() {
 
 get_cluster_url() {
     local name="$1"
-    
+
     if [[ ! -f "$CLUSTERS_FILE" ]]; then
         return 1
     fi
-    
+
     grep -v '^#' "$CLUSTERS_FILE" | grep -v '^$' | while IFS='|' read -r cluster_name url _type; do
         if [[ "$cluster_name" == "$name" ]]; then
             echo "$url"
@@ -374,11 +742,11 @@ get_cluster_url() {
 
 get_cluster_type() {
     local name="$1"
-    
+
     if [[ ! -f "$CLUSTERS_FILE" ]]; then
         return 1
     fi
-    
+
     grep -v '^#' "$CLUSTERS_FILE" | grep -v '^$' | while IFS='|' read -r cluster_name _url cluster_type; do
         if [[ "$cluster_name" == "$name" ]]; then
             echo "$cluster_type"
@@ -387,7 +755,6 @@ get_cluster_type() {
     done
 }
 
-# List all clusters (for menu)
 list_clusters() {
     if [[ ! -f "$CLUSTERS_FILE" ]]; then
         echo "$DEFAULT_CLUSTERS" | grep -v '^#' | grep -v '^$'
@@ -400,8 +767,6 @@ list_clusters() {
 # Interactive config functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Display cluster selection menu and get choice
-# Usage: select_cluster [existing_cluster]
 select_cluster() {
     local existing="${1:-}"
     local clusters=()
@@ -409,21 +774,21 @@ select_cluster() {
     local types=()
     local i=1
     local default_selection=1
-    
+
     echo "" >&2
-    echo "Select Aruba Central cluster:" >&2
+    echo "Select Aruba New Central cluster:" >&2
     echo "" >&2
-    
+
     while IFS='|' read -r name url type; do
         clusters+=("$name")
         urls+=("$url")
         types+=("$type")
-        
+
         # If this matches the existing cluster, make it the default
         if [[ "$name" == "$existing" ]]; then
             default_selection=$i
         fi
-        
+
         if [[ "$type" == "Private" ]]; then
             printf "  %2d) %-14s %s [Private]\n" "$i" "$name" "$url" >&2
         else
@@ -431,14 +796,14 @@ select_cluster() {
         fi
         ((i++))
     done < <(list_clusters)
-    
+
     echo "   c) Custom URL" >&2
     echo "" >&2
-    
+
     local selection
     read -r -p "Enter selection [$default_selection]: " selection
     selection="${selection:-$default_selection}"
-    
+
     if [[ "$selection" == "c" || "$selection" == "C" ]]; then
         local custom_url
         read -r -p "Enter custom cluster URL: " custom_url
@@ -451,45 +816,41 @@ select_cluster() {
     fi
 }
 
-# Prompt for a config value
-# Usage: prompt_value <prompt> [default] [required]
 prompt_value() {
     local prompt="$1"
     local default="${2:-}"
     local required="${3:-false}"
     local value
-    
+
     if [[ -n "$default" ]]; then
         read -r -p "$prompt [$default]: " value
         value="${value:-$default}"
     else
         read -r -p "$prompt: " value
     fi
-    
+
     if [[ "$required" == "true" && -z "$value" ]]; then
         log_error "This field is required."
         exit "$EXIT_ERROR"
     fi
-    
+
     echo "$value"
 }
 
 interactive_config() {
     local profile="$1"
     local force_edit="${2:-false}"
-    local existing_cluster="" existing_customer_id="" existing_client_id=""
-    local existing_client_secret="" existing_access_token="" existing_refresh_token=""
-    local existing_ssh_user="" existing_ssh_password=""
+    local existing_cluster="" existing_client_id=""
+    local existing_client_secret="" existing_ssh_user="" existing_ssh_password=""
     local is_first_profile=false
-    
+
     # Check if this is the first profile being created
     local existing_profiles
     existing_profiles=$(list_profiles)
     if [[ -z "$existing_profiles" ]]; then
         is_first_profile=true
     fi
-    
-    # If profile exists and user didn't explicitly specify it, ask what to do
+
     if profile_exists "$profile" && [[ "$force_edit" != "true" ]]; then
         echo ""
         echo "'$profile' is currently the active profile."
@@ -499,71 +860,61 @@ interactive_config() {
         echo "To list all:   $SCRIPT_NAME config --list"
         echo ""
         read -r -p "Create a new profile? Enter name (or press Enter to cancel): " new_profile_name
-        
+
         if [[ -z "$new_profile_name" ]]; then
             echo "Cancelled."
             return
         fi
-        
+
         # Recurse with the new profile name
         interactive_config "$new_profile_name" "false"
         return
     fi
-    
+
     echo ""
     echo "Configuring profile: $profile"
-    
-    # Load existing values if profile exists (for editing)
+
     if profile_exists "$profile"; then
         existing_cluster=$(read_ini_value "$CONFIG_FILE" "$profile" "cluster")
-        existing_customer_id=$(read_ini_value "$CONFIG_FILE" "$profile" "customer_id")
         existing_client_id=$(read_ini_value "$CONFIG_FILE" "$profile" "client_id")
         existing_client_secret=$(read_ini_value "$CONFIG_FILE" "$profile" "client_secret")
-        existing_access_token=$(read_ini_value "$CONFIG_FILE" "$profile" "access_token")
-        existing_refresh_token=$(read_ini_value "$CONFIG_FILE" "$profile" "refresh_token")
         existing_ssh_user=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_user")
         existing_ssh_password=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_password")
+        existing_max_aps_per_site=$(read_ini_value "$CONFIG_FILE" "$profile" "max_aps_per_site")
     fi
-    
-    # Select cluster
+
     local cluster
     cluster=$(select_cluster "$existing_cluster")
-    
-    # Prompt for other values
-    local customer_id client_id client_secret access_token refresh_token ssh_user ssh_password
-    
-    customer_id=$(prompt_value "Customer ID" "$existing_customer_id" "true")
+
+    local client_id client_secret ssh_user ssh_password max_aps_per_site
+
     client_id=$(prompt_value "Client ID" "$existing_client_id" "true")
     client_secret=$(prompt_value "Client Secret" "$existing_client_secret" "true")
-    access_token=$(prompt_value "Access Token" "$existing_access_token" "true")
-    refresh_token=$(prompt_value "Refresh Token" "$existing_refresh_token" "true")
     ssh_user=$(prompt_value "SSH Username" "${existing_ssh_user:-$DEFAULT_SSH_USER}")
     ssh_password=$(prompt_value "SSH Password (optional, Enter to skip)" "$existing_ssh_password")
-    
-    # Save profile
+    max_aps_per_site=$(prompt_value "Max APs per site for cache" "${existing_max_aps_per_site:-1000}")
+
     write_ini_value "$CONFIG_FILE" "$profile" "cluster" "$cluster"
-    write_ini_value "$CONFIG_FILE" "$profile" "customer_id" "$customer_id"
     write_ini_value "$CONFIG_FILE" "$profile" "client_id" "$client_id"
     write_ini_value "$CONFIG_FILE" "$profile" "client_secret" "$client_secret"
-    write_ini_value "$CONFIG_FILE" "$profile" "access_token" "$access_token"
-    write_ini_value "$CONFIG_FILE" "$profile" "refresh_token" "$refresh_token"
     write_ini_value "$CONFIG_FILE" "$profile" "ssh_user" "$ssh_user"
     write_ini_value "$CONFIG_FILE" "$profile" "ssh_password" "$ssh_password"
-    
+    write_ini_value "$CONFIG_FILE" "$profile" "max_aps_per_site" "$max_aps_per_site"
+
     echo ""
     echo "Configuration saved."
-    
+
     # If this is the first profile, automatically set it as default
     if [[ "$is_first_profile" == true ]]; then
         set_default_profile "$profile"
         echo "Default profile set to: $profile"
         return
     fi
-    
+
     # Ask to set as default if not already
     local current_default
     current_default=$(get_default_profile)
-    
+
     if [[ "$current_default" != "$profile" ]]; then
         local set_default
         read -r -p "Set '$profile' as default profile? [y/N]: " set_default
@@ -578,7 +929,7 @@ interactive_config() {
 mask_value() {
     local value="$1"
     local len=${#value}
-    
+
     if [[ -z "$value" ]]; then
         echo "(not set)"
     elif [[ $len -le 8 ]]; then
@@ -594,65 +945,75 @@ show_config() {
     local unmask="${2:-false}"
     local default_profile
     default_profile=$(get_default_profile)
-    
+
     if ! profile_exists "$profile"; then
         log_error "Profile '$profile' does not exist."
         exit "$EXIT_CONFIG_ERROR"
     fi
-    
-    local cluster customer_id client_id client_secret access_token refresh_token ssh_user ssh_password
+
+    local cluster client_id client_secret access_token token_timestamp ssh_user ssh_password max_aps_per_site
     cluster=$(read_ini_value "$CONFIG_FILE" "$profile" "cluster")
-    customer_id=$(read_ini_value "$CONFIG_FILE" "$profile" "customer_id")
     client_id=$(read_ini_value "$CONFIG_FILE" "$profile" "client_id")
     client_secret=$(read_ini_value "$CONFIG_FILE" "$profile" "client_secret")
     access_token=$(read_ini_value "$CONFIG_FILE" "$profile" "access_token")
-    refresh_token=$(read_ini_value "$CONFIG_FILE" "$profile" "refresh_token")
+    token_timestamp=$(read_ini_value "$CONFIG_FILE" "$profile" "token_timestamp")
     ssh_user=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_user")
     ssh_user="${ssh_user:-$DEFAULT_SSH_USER}"
     ssh_password=$(read_ini_value "$CONFIG_FILE" "$profile" "ssh_password")
-    
+    max_aps_per_site=$(read_ini_value "$CONFIG_FILE" "$profile" "max_aps_per_site")
+    max_aps_per_site="${max_aps_per_site:-1000}"
+
     local cluster_url
     cluster_url=$(get_cluster_url "$cluster")
     if [[ -z "$cluster_url" && "$cluster" == http* ]]; then
         cluster_url="$cluster"
     fi
-    
+
     local ssh_timeout
     ssh_timeout=$(get_ssh_timeout)
-    
+
     echo ""
     if [[ "$profile" == "$default_profile" ]]; then
         echo "Profile: $profile (active)"
     else
         echo "Profile: $profile"
     fi
-    
+
     if [[ -n "$cluster_url" ]]; then
         echo "Cluster:       $cluster ($cluster_url)"
     else
         echo "Cluster:       $cluster"
     fi
-    echo "Customer ID:   ${customer_id:-(not set)}"
     echo "Client ID:     ${client_id:-(not set)}"
-    
+
     if [[ "$unmask" == "true" ]]; then
         echo "Client Secret: ${client_secret:-(not set)}"
         echo "Access Token:  ${access_token:-(not set)}"
-        echo "Refresh Token: ${refresh_token:-(not set)}"
+        if [[ -n "$token_timestamp" ]]; then
+            echo "Token Time:    $(date -d "@$token_timestamp" 2>/dev/null || date -r "$token_timestamp" 2>/dev/null || echo "$token_timestamp")"
+        else
+            echo "Token Time:    (not set)"
+        fi
         echo "SSH Username:  $ssh_user"
         echo "SSH Password:  ${ssh_password:-(not set)}"
+        echo "Max APs/site:  $max_aps_per_site"
     else
         echo "Client Secret: $(mask_value "$client_secret")"
         echo "Access Token:  $(mask_value "$access_token")"
-        echo "Refresh Token: $(mask_value "$refresh_token")"
+        if [[ -n "$token_timestamp" ]]; then
+            echo "Token Time:    $(date -d "@$token_timestamp" 2>/dev/null || date -r "$token_timestamp" 2>/dev/null || echo "$token_timestamp")"
+        else
+            echo "Token Time:    (not set)"
+        fi
         echo "SSH Username:  $ssh_user"
         if [[ -n "$ssh_password" ]]; then
             echo "SSH Password:  ********"
         else
             echo "SSH Password:  (not set)"
         fi
+        echo "Max APs/site:  $max_aps_per_site"
     fi
-    
+
     echo "SSH Timeout:   ${ssh_timeout}s"
     echo ""
     echo "Config file: $CONFIG_FILE"
@@ -667,7 +1028,7 @@ cmd_config_list() {
     local default_profile profiles
     default_profile=$(get_default_profile)
     profiles=$(list_profiles)
-    
+
     if [[ -z "$profiles" ]]; then
         echo ""
         echo "No profiles configured."
@@ -675,10 +1036,10 @@ cmd_config_list() {
         echo ""
         return
     fi
-    
+
     echo ""
     echo "Available profiles:"
-    
+
     while read -r profile; do
         if [[ "$profile" == "$default_profile" ]]; then
             echo "  * $profile (active)"
@@ -686,7 +1047,7 @@ cmd_config_list() {
             echo "    $profile"
         fi
     done <<< "$profiles"
-    
+
     echo ""
 }
 
@@ -697,7 +1058,7 @@ cmd_config() {
     local delete=false
     local use_profile=""
     local config_profile=""
-    
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --show)
@@ -743,35 +1104,35 @@ cmd_config() {
                 ;;
         esac
     done
-    
+
     # Handle --list
     if [[ "$list" == true ]]; then
         cmd_config_list
         return
     fi
-    
+
     # Handle --delete (requires --profile)
     if [[ "$delete" == true ]]; then
         if [[ -z "$config_profile" ]]; then
             log_error "--delete requires --profile <name>"
             exit "$EXIT_ERROR"
         fi
-        
+
         if ! profile_exists "$config_profile"; then
             log_error "Profile '$config_profile' does not exist."
             exit "$EXIT_CONFIG_ERROR"
         fi
-        
+
         # Check if it's the active profile
         local current_default
         current_default=$(get_default_profile)
-        
+
         if [[ "$config_profile" == "$current_default" ]]; then
             log_error "Cannot delete the active profile."
             log_error "Use '$SCRIPT_NAME config --use <other_profile>' to switch first."
             exit "$EXIT_ERROR"
         fi
-        
+
         # Confirm deletion
         local confirm
         read -r -p "Delete profile '$config_profile'? [y/N]: " confirm
@@ -779,12 +1140,12 @@ cmd_config() {
             echo "Cancelled."
             return
         fi
-        
+
         delete_ini_section "$CONFIG_FILE" "$config_profile"
         echo "Profile '$config_profile' deleted."
         return
     fi
-    
+
     # Handle --use
     if [[ -n "$use_profile" ]]; then
         if ! profile_exists "$use_profile"; then
@@ -795,7 +1156,7 @@ cmd_config() {
         echo "Default profile set to: $use_profile"
         return
     fi
-    
+
     # Determine which profile to work with and whether user explicitly specified it
     local target_profile
     local explicit_profile=false
@@ -808,13 +1169,13 @@ cmd_config() {
     else
         target_profile=$(get_default_profile)
     fi
-    
+
     # Handle --show
     if [[ "$show" == true ]]; then
         show_config "$target_profile" "$unmask"
         return
     fi
-    
+
     # Default: interactive configuration
     # Pass explicit_profile so we know if user wants to edit an existing profile
     interactive_config "$target_profile" "$explicit_profile"
@@ -824,147 +1185,206 @@ cmd_config() {
 # MAC address functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Accepts: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff
 validate_mac() {
     local mac="$1"
-    
-    # Remove separators and convert to lowercase
+
     local clean_mac
     clean_mac=$(echo "$mac" | tr -d ':.-' | tr '[:upper:]' '[:lower:]')
-    
-    # Check if it's 12 hex characters
-    if [[ ! "$clean_mac" =~ ^[0-9a-f]{12}$ ]]; then
-        return 1
-    fi
-    
-    return 0
+
+    [[ "$clean_mac" =~ ^[0-9a-f]{12}$ ]]
 }
 
-# Normalize MAC address to lowercase colon-separated format
 normalize_mac() {
     local mac="$1"
-    
-    # Remove separators and convert to lowercase
+
     local clean_mac
     clean_mac=$(echo "$mac" | tr -d ':.-' | tr '[:upper:]' '[:lower:]')
-    
-    # Insert colons
+
     echo "$clean_mac" | sed 's/\(..\)/\1:/g' | sed 's/:$//'
+}
+
+get_local_wifi_mac() {
+    local os_type
+    os_type=$(uname -s)
+
+    case "$os_type" in
+        Darwin)
+            # macOS - Use networksetup to find Wi-Fi interface (fast: ~28ms)
+            local wifi_iface
+            wifi_iface=$(networksetup -listallhardwareports 2>/dev/null | grep -A 1 "Wi-Fi" | grep "Device:" | awk '{print $2}')
+
+            if [[ -z "$wifi_iface" ]]; then
+                return 1
+            fi
+
+            local status
+            status=$(ifconfig "$wifi_iface" 2>/dev/null | grep "status:" | awk '{print $2}')
+
+            if [[ "$status" != "active" ]]; then
+                return 1
+            fi
+
+            if ! ifconfig "$wifi_iface" 2>/dev/null | grep -q "inet "; then
+                return 1
+            fi
+
+            local wifi_mac
+            wifi_mac=$(ifconfig "$wifi_iface" 2>/dev/null | grep "ether" | awk '{print $2}')
+
+            if [[ -n "$wifi_mac" ]]; then
+                echo "$wifi_mac"
+                return 0
+            fi
+            ;;
+
+        Linux)
+            local iw_output
+            iw_output=$(iw dev 2>/dev/null)
+
+            if [[ -z "$iw_output" ]]; then
+                return 1
+            fi
+
+            local current_mac=""
+            local has_ssid=false
+
+            while IFS= read -r line; do
+                if [[ "$line" =~ Interface[[:space:]]([a-zA-Z0-9]+) ]]; then
+                    if [[ -n "$current_mac" && "$has_ssid" == true ]]; then
+                        echo "$current_mac"
+                        return 0
+                    fi
+
+                    current_mac=""
+                    has_ssid=false
+
+                elif [[ "$line" =~ addr[[:space:]]([0-9a-fA-F:]+) ]]; then
+                    current_mac="${BASH_REMATCH[1]}"
+
+                elif [[ "$line" =~ ssid[[:space:]](.+) ]]; then
+                    has_ssid=true
+                fi
+            done <<< "$iw_output"
+
+            if [[ -n "$current_mac" && "$has_ssid" == true ]]; then
+                echo "$current_mac"
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
 }
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # OAuth2 functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Returns: 0 on success, 1 on failure
-# Sets: NEW_ACCESS_TOKEN, NEW_REFRESH_TOKEN
-refresh_access_token() {
-    local url="$CLUSTER_URL/oauth2/token"
-    
-    log_verbose "Refreshing access token..."
-    
-    local payload
-    payload=$(jq -n \
-        --arg client_id "$CLIENT_ID" \
-        --arg client_secret "$CLIENT_SECRET" \
-        --arg refresh_token "$REFRESH_TOKEN" \
-        '{
-            client_id: $client_id,
-            client_secret: $client_secret,
-            grant_type: "refresh_token",
-            refresh_token: $refresh_token
-        }')
-    
+generate_access_token() {
+    local url="https://sso.common.cloud.hpe.com/as/token.oauth2"
+
+    log_verbose "Generating access token..."
+
     local response http_code
     response=$(curl -s -w "\n%{http_code}" \
         -X POST "$url" \
-        -H "Authorization: Bearer $ACCESS_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "$payload")
-    
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET")
+
     http_code=$(echo "$response" | tail -n1)
     response=$(echo "$response" | sed '$d')
-    
+
     if [[ "$http_code" != "200" ]]; then
-        log_error "Token refresh failed (HTTP $http_code)"
+        log_error "Token generation failed (HTTP $http_code)"
         log_verbose "Response: $response"
         return 1
     fi
-    
+
     NEW_ACCESS_TOKEN=$(echo "$response" | jq -r '.access_token // empty')
-    NEW_REFRESH_TOKEN=$(echo "$response" | jq -r '.refresh_token // empty')
-    
+
     if [[ -z "$NEW_ACCESS_TOKEN" ]]; then
-        log_error "Token refresh response missing access_token"
+        log_error "Token generation response missing access_token"
         log_verbose "Response: $response"
         return 1
     fi
-    
+
     return 0
 }
 
-update_tokens() {
+update_token() {
     local profile="$1"
     local access_token="$2"
-    local refresh_token="$3"
-    
+    local timestamp
+    timestamp=$(date +%s)
+
     write_ini_value "$CONFIG_FILE" "$profile" "access_token" "$access_token"
-    if [[ -n "$refresh_token" ]]; then
-        write_ini_value "$CONFIG_FILE" "$profile" "refresh_token" "$refresh_token"
-    fi
-    
+    write_ini_value "$CONFIG_FILE" "$profile" "token_timestamp" "$timestamp"
+
     # Update global variables
     ACCESS_TOKEN="$access_token"
-    if [[ -n "$refresh_token" ]]; then
-        REFRESH_TOKEN="$refresh_token"
-    fi
-    
-    log_verbose "Tokens updated in config"
+    TOKEN_TIMESTAMP="$timestamp"
+
+    log_verbose "Token updated in config with timestamp $timestamp"
+}
+
+is_token_expired() {
+    local token_timestamp="${TOKEN_TIMESTAMP:-0}"
+    local current_time
+    current_time=$(date +%s)
+    local age=$((current_time - token_timestamp))
+
+    [[ $age -gt 720 ]]
 }
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # API functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Usage: api_get <endpoint> [retry_on_401]
-# Returns: JSON response or exits on error
 api_get() {
     local endpoint="$1"
-    local retry_on_401="${2:-true}"
     local url="$CLUSTER_URL$endpoint"
     local max_retries=3
     local retry_count=0
-    
+
+    # Check if token needs refresh before making request
+    if is_token_expired; then
+        log_verbose "Token expired or expiring soon, generating new token..."
+        if generate_access_token; then
+            update_token "$CURRENT_PROFILE" "$NEW_ACCESS_TOKEN"
+            log_verbose "New token generated successfully"
+        else
+            log_error "Failed to generate access token. Check your credentials."
+            exit "$EXIT_API_ERROR"
+        fi
+    fi
+
     while true; do
         local headers=(-H "Authorization: Bearer $ACCESS_TOKEN" \
                        -H "Content-Type: application/json" \
                        -H "cache-control: no-cache")
-        
+
         log_verbose "GET $url"
-        
+
         local response http_code
         response=$(curl -s -w "\n%{http_code}" -X GET "$url" "${headers[@]}")
         http_code=$(echo "$response" | tail -n1)
         response=$(echo "$response" | sed '$d')
-        
+
         log_verbose "HTTP $http_code"
-        
-        # Handle 401 - token refresh
-        if [[ "$http_code" == "401" && "$retry_on_401" == "true" ]]; then
-            log_verbose "Received 401, attempting token refresh..."
-            
-            if refresh_access_token; then
-                update_tokens "$CURRENT_PROFILE" "$NEW_ACCESS_TOKEN" "$NEW_REFRESH_TOKEN"
-                log_verbose "Token refreshed, retrying request..."
-                retry_on_401="false"  # Only retry once
+
+        if [[ "$http_code" == "401" ]]; then
+            log_verbose "Received 401, attempting to generate new token..."
+
+            if generate_access_token; then
+                update_token "$CURRENT_PROFILE" "$NEW_ACCESS_TOKEN"
+                log_verbose "New token generated, retrying request..."
                 continue
             else
                 log_error "Authentication failed. Check your credentials or run 'ap-hop config' to reconfigure."
                 exit "$EXIT_API_ERROR"
             fi
         fi
-        
-        # Handle 429 - rate limit
+
         if [[ "$http_code" == "429" ]]; then
             ((retry_count++))
             if [[ $retry_count -ge $max_retries ]]; then
@@ -975,31 +1395,84 @@ api_get() {
             sleep 1
             continue
         fi
-        
-        # Handle other errors
+
         if [[ "$http_code" != "200" ]]; then
             echo "$response"
             return "$http_code"
         fi
-        
+
         echo "$response"
         return 0
     done
 }
 
-# Returns: JSON response or exits on error
 get_client_by_mac() {
     local mac="$1"
-    local endpoint="/monitoring/v2/clients/$mac"
-    
+    local site_id="$2"
+
+    local encoded_mac="${mac//:/%3A}"
+
+    local endpoint="/network-monitoring/v1alpha1/clients/${encoded_mac}?site-id=${site_id}"
+
     api_get "$endpoint"
 }
 
-# Returns: JSON response or exits on error
+get_serial_by_bssid() {
+    local bssid="$1"
+    local site_id="$2"
+    local site_name="$3"
+
+    if ! is_aps_cache_valid "$site_id" "$site_name"; then
+        if ! fetch_and_cache_aps "$site_id" "$site_name"; then
+            echo "Failed to build AP cache for site '$site_name'" >&2
+            return 1
+        fi
+    fi
+
+    local result
+    result=$(find_serial_by_bssid_cached "$bssid" "$site_id" "$site_name") || {
+        echo "BSSID not found in cache" >&2
+        return 1
+    }
+
+    local serial name mac ip
+    IFS='|' read -r serial name mac ip <<< "$result"
+
+    if [[ "$VERIFY_AP_STATUS" == true ]]; then
+        echo "Verifying AP status..." >&2
+        local ap_response
+        ap_response=$(api_get "/network-monitoring/v1alpha1/aps/${serial}" 2>/dev/null) || {
+            echo "Warning: Failed to verify AP status" >&2
+        }
+
+        if [[ -n "$ap_response" ]]; then
+            local current_ip
+            current_ip=$(echo "$ap_response" | jq -r '.ipv4 // empty')
+            if [[ -n "$current_ip" && "$current_ip" != "$ip" ]]; then
+                echo "Note: AP IP changed from $ip to $current_ip" >&2
+                ip="$current_ip"
+            fi
+
+            local status
+            status=$(echo "$ap_response" | jq -r '.status // "Unknown"')
+            if [[ "$status" != "ONLINE" ]]; then
+                echo "Warning: AP status is '$status'" >&2
+            fi
+        fi
+    fi
+
+    AP_NAME="$name"
+    AP_MAC="$mac"
+    AP_IP="$ip"
+
+    echo "$serial"
+    return 0
+}
+
 get_ap_by_serial() {
     local serial="$1"
-    local endpoint="/monitoring/v1/aps/$serial"
-    
+    local endpoint="/network-monitoring/v1alpha1/aps/$serial"
+
     api_get "$endpoint"
 }
 
@@ -1007,20 +1480,19 @@ get_ap_by_serial() {
 # SSH functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Get SSH password from config, env, or prompt
 get_ssh_password() {
     # Check config
     if [[ -n "$SSH_PASSWORD" ]]; then
         echo "$SSH_PASSWORD"
         return
     fi
-    
+
     # Check environment variable
     if [[ -n "${ARUBA_SSH_PASSWORD:-}" ]]; then
         echo "$ARUBA_SSH_PASSWORD"
         return
     fi
-    
+
     # Prompt user
     local password
     read -r -s -p "SSH Password: " password
@@ -1033,10 +1505,10 @@ ssh_to_ap() {
     local password="$2"
     local timeout
     timeout=$(get_ssh_timeout)
-    
+
     log_info "Connecting..."
     log_verbose "sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$timeout -o LogLevel=ERROR $SSH_USER@$ip"
-    
+
     local ssh_exit_code
     SSHPASS="$password" sshpass -e ssh \
         -o StrictHostKeyChecking=no \
@@ -1045,13 +1517,13 @@ ssh_to_ap() {
         -o LogLevel=ERROR \
         "$SSH_USER@$ip"
     ssh_exit_code=$?
-    
+
     # sshpass exit code 5 = invalid/incorrect password
     if [[ $ssh_exit_code -eq 5 ]]; then
         log_error "SSH authentication failed. Is the password correct?"
         log_error "Update with: $SCRIPT_NAME config --profile $CURRENT_PROFILE"
     fi
-    
+
     return $ssh_exit_code
 }
 
@@ -1059,164 +1531,418 @@ ssh_to_ap() {
 # Main workflow
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-cmd_mac() {
-    local mac="$1"
-    
-    if ! validate_mac "$mac"; then
-        log_error "Invalid MAC address format: $mac"
+cmd_lookup() {
+    local input="$1"
+
+    # Validate input is MAC/BSSID format
+    if ! validate_mac "$input"; then
+        log_error "Invalid MAC/BSSID format: $input"
         log_error "Accepted formats: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff"
         exit "$EXIT_VALIDATION_ERROR"
     fi
-    
-    local normalized_mac
-    normalized_mac=$(normalize_mac "$mac")
-    
+
+    local normalized_input
+    normalized_input=$(normalize_mac "$input")
+
+    # Load profile
     CURRENT_PROFILE="${PROFILE:-$(get_default_profile)}"
-    
     load_profile "$CURRENT_PROFILE"
-    
+
     log_verbose "Using profile: $CURRENT_PROFILE"
     log_verbose "Cluster: $CLUSTER ($CLUSTER_URL)"
-    
+
+    # === SITE CACHE MANAGEMENT ===
+
+    # Check cache validity
+    if ! is_sites_cache_valid; then
+        log_info "Site cache expired or missing, fetching sites..."
+        if ! fetch_and_cache_sites "$CURRENT_PROFILE"; then
+            log_error "Failed to fetch sites from API"
+            exit "$EXIT_API_ERROR"
+        fi
+    fi
+
+    # Load sites into memory
+    if ! load_cached_sites; then
+        log_error "Failed to load sites cache"
+        exit "$EXIT_ERROR"
+    fi
+
+    # === SITE SELECTION ===
+
+    local site_id site_name site_client_count
+
+    if [[ -n "$SITE_ID_FILTER" ]]; then
+        # User provided --site-id
+        site_id="$SITE_ID_FILTER"
+        site_name=$(find_site_by_id "$site_id")
+
+        if [[ -z "$site_name" ]]; then
+            log_error "Site ID '$site_id' not found in cache"
+            log_error "Run '$SCRIPT_NAME --list-sites' to see available sites"
+            exit "$EXIT_ERROR"
+        fi
+
+        log_verbose "Using site: $site_name (ID: $site_id)"
+
+    elif [[ -n "$SITE_FILTER" ]]; then
+        # User provided --site <name>
+        site_id=$(find_site_by_name "$SITE_FILTER")
+
+        if [[ -z "$site_id" ]]; then
+            log_error "Site '$SITE_FILTER' not found in cache"
+            log_error "Run '$SCRIPT_NAME --list-sites' to see available sites"
+            exit "$EXIT_ERROR"
+        fi
+
+        site_name="$SITE_FILTER"
+        log_verbose "Using site: $site_name (ID: $site_id)"
+
+    else
+        # Interactive site selection
+        while true; do
+            select_site
+
+            if [[ "$SELECTED_SITE_ID" == "__REFRESH__" ]]; then
+                log_info "Refreshing site cache..."
+                invalidate_sites_cache
+                fetch_and_cache_sites "$CURRENT_PROFILE"
+                load_cached_sites
+                continue
+            fi
+
+            site_id="$SELECTED_SITE_ID"
+            site_name="$SELECTED_SITE_NAME"
+            site_client_count="$SELECTED_SITE_CLIENT_COUNT"
+
+            # Warn if 0 clients
+            if [[ "$site_client_count" -eq 0 ]]; then
+                log_info "WARNING: Site '$site_name' currently has 0 clients"
+            fi
+
+            break
+        done
+    fi
+
     log_info ""
-    log_info "Looking up client $normalized_mac..."
-    
-    local client_response
-    local client_exit_code
-    client_response=$(get_client_by_mac "$normalized_mac") && client_exit_code=0 || client_exit_code=$?
-    
-    # Handle 404 - client not found (exit code 148 = 404 mod 256)
-    if [[ $client_exit_code -eq 148 ]] || [[ $client_exit_code -eq 404 ]]; then
-        log_error "client not found"
-        exit "$EXIT_API_ERROR"
-    fi
-    
-    # Handle other non-success responses
-    if [[ $client_exit_code -ne 0 ]]; then
-        if ! is_valid_json "$client_response"; then
-            log_error "API request failed - invalid response from server"
-            log_verbose "Response: $client_response"
-        elif echo "$client_response" | jq -e '.error' &>/dev/null; then
-            local error_msg
-            error_msg=$(echo "$client_response" | jq -r '.error // "Unknown error"')
-            log_error "API error: $error_msg"
-        else
-            log_error "API request failed (HTTP $client_exit_code)"
-            log_verbose "Response: $client_response"
+    log_info "Searching in site: $site_name"
+    log_info ""
+
+    # === CLIENT/BSSID LOOKUP ===
+
+    local client_response ap_serial lookup_method
+
+    # Try 1: Lookup as client MAC
+    log_info "Looking up: $normalized_input..."
+
+    if client_response=$(get_client_by_mac "$normalized_input" "$site_id" 2>/dev/null); then
+        # Success - extract serial
+        ap_serial=$(echo "$client_response" | jq -r '.connectedDeviceSerial // empty')
+        lookup_method="MAC"
+
+        if [[ -z "$ap_serial" ]]; then
+            log_error "Client found but no AP serial in response"
+            exit "$EXIT_API_ERROR"
         fi
-        exit "$EXIT_API_ERROR"
-    fi
-    
-    # Check if response is valid JSON
-    if ! is_valid_json "$client_response"; then
-        log_error "API returned invalid response"
-        log_verbose "Response: $client_response"
-        exit "$EXIT_API_ERROR"
-    fi
-    
-    # Check for error in response (only .error field indicates an API error)
-    if echo "$client_response" | jq -e '.error' &>/dev/null 2>&1; then
-        local error_msg
-        error_msg=$(echo "$client_response" | jq -r '.error // "Unknown error"')
-        log_error "API error: $error_msg"
-        exit "$EXIT_API_ERROR"
-    fi
-    
-    # Display verbose client details (raw JSON)
-    if [[ "$VERBOSE" == true ]]; then
-        echo ""
-        echo "Client Response:"
-        echo "$client_response" | jq .
-    fi
-    
-    # Extract AP serial
-    local ap_serial
-    ap_serial=$(echo "$client_response" | jq -r '.associated_device // empty')
-    
-    if [[ -z "$ap_serial" ]]; then
-        log_error "Client found but no associated AP"
-        exit "$EXIT_API_ERROR"
-    fi
-    
-    log_verbose ""
-    log_verbose "Looking up AP $ap_serial..."
-    
-    # Look up AP
-    local ap_response
-    if ! ap_response=$(get_ap_by_serial "$ap_serial"); then
-        if ! is_valid_json "$ap_response"; then
-            log_error "Failed to look up AP $ap_serial - invalid response from server"
-            log_verbose "Response: $ap_response"
-        else
-            log_error "Failed to look up AP $ap_serial"
-            log_verbose "Response: $ap_response"
+
+        # Display verbose client details
+        if [[ "$VERBOSE" == true ]]; then
+            echo ""
+            echo "Client Response:"
+            echo "$client_response" | jq .
         fi
-        exit "$EXIT_API_ERROR"
+
+    else
+        log_info "Client not found, trying as BSSID..."
+
+        # Capture stdout while allowing the function to set global variables
+        # Use a temp file to avoid subshell that would lose global variable assignments
+        local temp_file
+        temp_file=$(mktemp)
+        if get_serial_by_bssid "$normalized_input" "$site_id" "$site_name" > "$temp_file"; then
+            ap_serial=$(cat "$temp_file")
+            rm -f "$temp_file"
+            lookup_method="BSSID"
+            log_info "Found by BSSID"
+        else
+            rm -f "$temp_file"
+            log_error "$normalized_input not found in site '$site_name'"
+            exit "$EXIT_API_ERROR"
+        fi
     fi
-    
-    # Check if response is valid JSON
-    if ! is_valid_json "$ap_response"; then
-        log_error "AP lookup returned invalid response"
-        log_verbose "Response: $ap_response"
-        exit "$EXIT_API_ERROR"
-    fi
-    
-    # Check for error in response (only .error field indicates an API error)
-    if echo "$ap_response" | jq -e '.error' &>/dev/null 2>&1; then
-        local error_msg
-        error_msg=$(echo "$ap_response" | jq -r '.error // "Unknown error"')
-        log_error "AP lookup failed: $error_msg"
-        exit "$EXIT_API_ERROR"
-    fi
-    
-    # Display verbose AP details (raw JSON)
-    if [[ "$VERBOSE" == true ]]; then
-        echo ""
-        echo "AP Response:"
-        echo "$ap_response" | jq .
-    fi
-    
-    # Extract AP info
+
     local ap_name ap_mac ap_ip ap_status down_reason
-    ap_name=$(echo "$ap_response" | jq -r '.name // "Unknown"')
-    ap_mac=$(echo "$ap_response" | jq -r '.macaddr // "Unknown"')
-    ap_ip=$(echo "$ap_response" | jq -r '.ip_address // empty')
-    ap_status=$(echo "$ap_response" | jq -r '.status // "Unknown"')
-    down_reason=$(echo "$ap_response" | jq -r '.down_reason // ""')
-    
-    if [[ -z "$ap_ip" ]]; then
-        log_error "AP found but no IP address available"
-        exit "$EXIT_API_ERROR"
+
+    if [[ "$lookup_method" == "BSSID" && "$VERIFY_AP_STATUS" != true ]]; then
+        ap_name="$AP_NAME"
+        ap_mac="$AP_MAC"
+        ap_ip="$AP_IP"
+        ap_status="ONLINE"
+    else
+        log_verbose ""
+        log_verbose "Looking up AP $ap_serial..."
+
+        local ap_response
+        if ! ap_response=$(get_ap_by_serial "$ap_serial"); then
+            if ! is_valid_json "$ap_response"; then
+                log_error "Failed to look up AP $ap_serial - invalid response from server"
+                log_verbose "Response: $ap_response"
+            else
+                log_error "Failed to look up AP $ap_serial"
+                log_verbose "Response: $ap_response"
+            fi
+            exit "$EXIT_API_ERROR"
+        fi
+
+        if ! is_valid_json "$ap_response"; then
+            log_error "AP lookup returned invalid response"
+            log_verbose "Response: $ap_response"
+            exit "$EXIT_API_ERROR"
+        fi
+
+        if echo "$ap_response" | jq -e '.error' &>/dev/null 2>&1; then
+            local error_msg
+            error_msg=$(echo "$ap_response" | jq -r '.error // "Unknown error"')
+            log_error "AP lookup failed: $error_msg"
+            exit "$EXIT_API_ERROR"
+        fi
+
+        if [[ "$VERBOSE" == true ]]; then
+            echo ""
+            echo "AP Response:"
+            echo "$ap_response" | jq .
+        fi
+
+        ap_name=$(echo "$ap_response" | jq -r '.deviceName // "Unknown"')
+        ap_mac=$(echo "$ap_response" | jq -r '.macAddress // "Unknown"')
+        ap_ip=$(echo "$ap_response" | jq -r '.ipv4 // empty')
+        ap_status=$(echo "$ap_response" | jq -r '.status // "Unknown"')
+        down_reason=$(echo "$ap_response" | jq -r '.down_reason // ""')
+
+        if [[ -z "$ap_ip" ]]; then
+            log_error "AP found but no IP address available"
+            exit "$EXIT_API_ERROR"
+        fi
     fi
-    
-    # Print AP summary
-    log_info "Client found on AP: $ap_name ($ap_mac) at $ap_ip"
-    
+
+    if [[ "$lookup_method" == "MAC" ]]; then
+        log_info "Client found on AP: $ap_name ($ap_mac) at $ap_ip"
+    else
+        log_info "BSSID found on AP: $ap_name ($ap_mac) at $ap_ip"
+    fi
+
     # Warn if AP is down
     if [[ "$ap_status" == "Down" ]]; then
         log_info "WARNING: AP status is 'Down' (Reason: ${down_reason:-Unknown})"
         log_info "Attempting SSH anyway..."
     fi
-    
+
     # Dry run check
     if [[ "$DRY_RUN" == true ]]; then
         log_info "Dry run - not connecting. Would SSH to $SSH_USER@$ap_ip"
         exit "$EXIT_SUCCESS"
     fi
-    
+
     # Get SSH password
     local password
     password=$(get_ssh_password)
-    
+
     if [[ -z "$password" ]]; then
         log_error "No SSH password provided"
         exit "$EXIT_SSH_ERROR"
     fi
-    
+
     # SSH to AP
     if ! ssh_to_ap "$ap_ip" "$password"; then
         exit "$EXIT_SSH_ERROR"
     fi
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Site management commands
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+cmd_list_sites() {
+    ensure_config_dir
+
+    CURRENT_PROFILE="${PROFILE:-$(get_default_profile)}"
+    load_profile "$CURRENT_PROFILE"
+
+    if ! is_sites_cache_valid; then
+        log_info "Cache expired, fetching sites..."
+        fetch_and_cache_sites
+    fi
+
+    load_cached_sites
+
+    local cache_file
+    cache_file=$(get_sites_cache_file)
+    local cache_time cache_timestamp
+    # Get modification time in epoch format (cross-platform)
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        cache_timestamp=$(stat -f %m "$cache_file" 2>/dev/null)
+    else
+        cache_timestamp=$(stat -c %Y "$cache_file" 2>/dev/null)
+    fi
+    cache_time=$(date -d "@$cache_timestamp" 2>/dev/null || date -r "$cache_timestamp" 2>/dev/null || echo "unknown")
+
+    echo ""
+    echo "Cached sites (updated: $cache_time):"
+    echo ""
+
+    local hidden_count=0
+    local visible_count=0
+
+    for ((i=0; i<${#SITE_IDS[@]}; i++)); do
+        if [[ "${SITE_CLIENT_COUNTS[$i]}" -gt 0 ]] || [[ "$SHOW_ALL_SITES" == true ]]; then
+            printf "  %-35s (ID: %-18s, %3d clients)\n" \
+                "${SITE_NAMES[$i]}" "${SITE_IDS[$i]}" "${SITE_CLIENT_COUNTS[$i]}"
+            visible_count=$((visible_count + 1))
+        else
+            hidden_count=$((hidden_count + 1))
+        fi
+    done
+
+    if [[ $hidden_count -gt 0 ]]; then
+        echo ""
+        echo "Note: $hidden_count sites have 0 clients (use --all to show or refresh the site cache)"
+    fi
+
+    if [[ $visible_count -eq 0 ]]; then
+        echo "No sites with clients found. Use --all to see all sites."
+    fi
+
+    echo ""
+}
+
+cmd_refresh_sites() {
+    ensure_config_dir
+
+    CURRENT_PROFILE="${PROFILE:-$(get_default_profile)}"
+    load_profile "$CURRENT_PROFILE"
+
+    log_info "Refreshing site cache..."
+    invalidate_sites_cache
+    fetch_and_cache_sites
+
+    log_info "Site cache refreshed"
+    echo ""
+    cmd_list_sites
+}
+
+cmd_list_aps() {
+    ensure_config_dir
+
+    CURRENT_PROFILE="${PROFILE:-$(get_default_profile)}"
+    load_profile "$CURRENT_PROFILE"
+
+    if [[ -z "$SITE_FILTER" && -z "$SITE_ID_FILTER" ]]; then
+        log_error "The --list-aps command requires --site or --site-id"
+        exit "$EXIT_ERROR"
+    fi
+
+    if ! is_sites_cache_valid; then
+        log_info "Cache expired, fetching sites..."
+        fetch_and_cache_sites
+    fi
+
+    load_cached_sites
+
+    local site_id site_name
+    if [[ -n "$SITE_ID_FILTER" ]]; then
+        site_id="$SITE_ID_FILTER"
+        site_name=$(find_site_by_id "$site_id")
+        if [[ -z "$site_name" ]]; then
+            log_error "Site ID '$site_id' not found"
+            exit "$EXIT_ERROR"
+        fi
+    else
+        site_id=$(find_site_by_name "$SITE_FILTER")
+        if [[ -z "$site_id" ]]; then
+            log_error "Site '$SITE_FILTER' not found"
+            exit "$EXIT_ERROR"
+        fi
+        site_name="$SITE_FILTER"
+    fi
+
+    local cache_file
+    cache_file=$(get_aps_cache_file "$site_id" "$site_name")
+
+    if ! is_aps_cache_valid "$site_id" "$site_name"; then
+        log_info "AP cache expired or missing, fetching..."
+        if ! fetch_and_cache_aps "$site_id" "$site_name"; then
+            log_error "Failed to fetch AP cache"
+            exit "$EXIT_ERROR"
+        fi
+    fi
+
+    local cache_time cache_timestamp
+    # Get modification time in epoch format (cross-platform)
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        cache_timestamp=$(stat -f %m "$cache_file" 2>/dev/null)
+    else
+        cache_timestamp=$(stat -c %Y "$cache_file" 2>/dev/null)
+    fi
+    cache_time=$(date -d "@$cache_timestamp" 2>/dev/null || date -r "$cache_timestamp" 2>/dev/null || echo "unknown")
+
+    echo ""
+    echo "Cached APs for '$site_name' (updated: $cache_time):"
+    echo ""
+
+    while IFS='|' read -r serial name mac ip bssids; do
+        [[ "$serial" =~ ^# ]] && continue
+        printf "%-15s %-20s %-15s %s\n" "$serial" "$name" "$ip" "$bssids"
+    done < <(grep -v '^#' "$cache_file")
+
+    echo ""
+}
+
+cmd_refresh_aps() {
+    ensure_config_dir
+
+    CURRENT_PROFILE="${PROFILE:-$(get_default_profile)}"
+    load_profile "$CURRENT_PROFILE"
+
+    if [[ -z "$SITE_FILTER" && -z "$SITE_ID_FILTER" ]]; then
+        log_error "The --refresh-aps command requires --site or --site-id"
+        exit "$EXIT_ERROR"
+    fi
+
+    if ! is_sites_cache_valid; then
+        log_info "Fetching sites..."
+        fetch_and_cache_sites
+    fi
+
+    load_cached_sites
+
+    local site_id site_name
+    if [[ -n "$SITE_ID_FILTER" ]]; then
+        site_id="$SITE_ID_FILTER"
+        site_name=$(find_site_by_id "$site_id")
+        if [[ -z "$site_name" ]]; then
+            log_error "Site ID '$site_id' not found"
+            exit "$EXIT_ERROR"
+        fi
+    else
+        site_id=$(find_site_by_name "$SITE_FILTER")
+        if [[ -z "$site_id" ]]; then
+            log_error "Site '$SITE_FILTER' not found"
+            exit "$EXIT_ERROR"
+        fi
+        site_name="$SITE_FILTER"
+    fi
+
+    log_info "Refreshing AP cache for '$site_name'..."
+    invalidate_aps_cache "$site_id" "$site_name"
+
+    if ! fetch_and_cache_aps "$site_id" "$site_name"; then
+        log_error "Failed to refresh AP cache"
+        exit "$EXIT_ERROR"
+    fi
+
+    log_info "AP cache refreshed"
+    echo ""
+    cmd_list_aps
 }
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1225,48 +1951,95 @@ cmd_mac() {
 
 show_help() {
     cat << EOF
-$SCRIPT_NAME v$VERSION - Aruba Central Client-to-AP SSH tool
+$SCRIPT_NAME v$VERSION - Aruba New Central "Jump-to-AP" SSH tool
 
 Quickly "hop" into the access point serving a wireless client by providing
-only the client's MAC address.
+only the client's MAC address or known AP BSSID.
 
 USAGE:
-    $SCRIPT_NAME [OPTIONS] <mac_address>
+    $SCRIPT_NAME [<mac|bssid>] [OPTIONS]
     $SCRIPT_NAME config [CONFIG_OPTIONS]
+    $SCRIPT_NAME --list-sites [--all]
+    $SCRIPT_NAME --refresh-sites
+    $SCRIPT_NAME --list-aps --site <name>
+    $SCRIPT_NAME --refresh-aps --site <name>
 
 ARGUMENTS:
-    <mac_address>       Client MAC address (aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, or aabbccddeeff)
+    <mac|bssid>    Client MAC address or BSSID (aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, or aabbccddeeff)
+                   If omitted, automatically detects and uses your devices Wi-Fi MAC address
 
-OPTIONS:
-    -p, --profile <name>    Use specified profile instead of default
-    -v, --verbose           Show raw JSON API responses
-    -n, --dry-run           Query API and show results without connecting via SSH
+GLOBAL OPTIONS:
     -h, --help              Show this help message
     --version               Show version
 
+SITE & AP CACHE COMMANDS (standalone):
+    --list-sites            Show cached sites and exit
+    --refresh-sites         Force refresh site cache and exit
+    --list-aps              Show cached APs (requires --site or --site-id)
+    --refresh-aps           Force refresh AP cache (requires --site or --site-id)
+
+MAC LOOKUP OPTIONS (used after MAC address):
+    -p, --profile <name>    Use specified profile instead of default
+    --site <name>           Search in specific site by name
+    --site-id <id>          Search in specific site by ID
+    --all                   Show all sites in interactive selection (not just those with clients)
+    --verify                Verify AP status via API before SSH (slower, ensures current data)
+    -v, --verbose           Show raw JSON API responses
+    -n, --dry-run           Query API and show results without connecting via SSH (auto-verbose)
+
+Note: --site and --site-id can be used before or after MAC address, and also work with
+      cache commands (--list-aps, --refresh-aps)
+
 CONFIG SUBCOMMAND:
-    $SCRIPT_NAME config                          Interactive setup
-    $SCRIPT_NAME config --profile <name>         Configure named profile
-    $SCRIPT_NAME config --show                   Show active profile
-    $SCRIPT_NAME config --list                   List all profiles
-    $SCRIPT_NAME config --use <name>             Set default profile
-    $SCRIPT_NAME config --delete --profile <name>   Delete a profile
+    $SCRIPT_NAME config                               Interactive setup
+    $SCRIPT_NAME config --profile <name>              Configure named profile
+    $SCRIPT_NAME config --show [--unmask]             Show active profile
+    $SCRIPT_NAME config --list                        List all profiles
+    $SCRIPT_NAME config --use <name>                  Set default profile
+    $SCRIPT_NAME config --delete --profile <name>     Delete a profile
 
 EXAMPLES:
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff
-    $SCRIPT_NAME --verbose aabbccddeeff
-    $SCRIPT_NAME --profile production aa-bb-cc-dd-ee-ff
-    $SCRIPT_NAME --dry-run aa:bb:cc:dd:ee:ff
-    $SCRIPT_NAME config
-    $SCRIPT_NAME config --use production
+    # Basic lookup
+    $SCRIPT_NAME                                      # Auto-detect local Wi-Fi
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff                    # Interactive site selection
+
+    # BSSID lookup
+    $SCRIPT_NAME 68:51:34:7c:32:10                   # BSSID lookup
+    $SCRIPT_NAME 68:51:34:7c:32:10 --verify          # With API verification
+
+    # Site selection
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --site "Twede's Cafe"
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --site-id 51101706940
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --all             # Show all sites including empty ones
+
+    # Profile and options
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --profile prod
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --verbose         # Show API responses
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --dry-run         # Test without SSH
+
+    # Combining options (flags after MAC address)
+    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --site "The Grid" --profile prod --verbose
+
+    # Site and AP cache management
+    $SCRIPT_NAME --list-sites                        # Show available sites
+    $SCRIPT_NAME --list-sites --all                  # Include sites with 0 clients
+    $SCRIPT_NAME --refresh-sites                     # Update site cache
+    $SCRIPT_NAME --list-aps --site "Twede's Cafe"    # Show APs in site
+    $SCRIPT_NAME --refresh-aps --site "Twede's Cafe" 
+
+    # Config management
+    $SCRIPT_NAME config                              # Interactive setup
+    $SCRIPT_NAME config --use prod                   # Set default profile
 
 ENVIRONMENT VARIABLES:
     ARUBA_SSH_PASSWORD      SSH password (if not in config)
     XDG_CONFIG_HOME         Config directory base (default: ~/.config)
 
 FILES:
-    \$XDG_CONFIG_HOME/$SCRIPT_NAME/config     Profile configuration
-    \$XDG_CONFIG_HOME/$SCRIPT_NAME/clusters   Cluster URL definitions
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/config          Profile configuration
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/clusters        Cluster URL definitions
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/sites_cache     Site cache (24hr TTL)
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/aps_cache_*     AP cache per site (24hr TTL)
 
 EOF
 }
@@ -1307,7 +2080,7 @@ EOF
 main() {
     # Parse global options (stop at first positional argument)
     local positional_args=()
-    
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -p|--profile)
@@ -1318,12 +2091,53 @@ main() {
                 PROFILE="$2"
                 shift 2
                 ;;
+            --site)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--site requires a site name"
+                    exit "$EXIT_ERROR"
+                fi
+                SITE_FILTER="$2"
+                shift 2
+                ;;
+            --site-id)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--site-id requires a site ID"
+                    exit "$EXIT_ERROR"
+                fi
+                SITE_ID_FILTER="$2"
+                shift 2
+                ;;
+            --list-sites)
+                LIST_SITES=true
+                shift
+                ;;
+            --refresh-sites)
+                REFRESH_SITES=true
+                shift
+                ;;
+            --list-aps)
+                LIST_APS=true
+                shift
+                ;;
+            --refresh-aps)
+                REFRESH_APS=true
+                shift
+                ;;
+            --all)
+                SHOW_ALL_SITES=true
+                shift
+                ;;
+            --verify)
+                VERIFY_AP_STATUS=true
+                shift
+                ;;
             -v|--verbose)
                 VERBOSE=true
                 shift
                 ;;
             -n|--dry-run)
                 DRY_RUN=true
+                VERBOSE=true  # Dry-run is automatically verbose
                 shift
                 ;;
             -h|--help)
@@ -1351,44 +2165,125 @@ main() {
                 ;;
         esac
     done
-    
+
     # Check dependencies
     check_dependencies
-    
+
     # Ensure config directory and files exist
     ensure_config_dir
     ensure_clusters_file
     ensure_config_file
-    
-    # Handle subcommands or MAC address
-    if [[ ${#positional_args[@]} -eq 0 ]]; then
-        show_help
+
+    # Handle --list-sites and --refresh-sites commands
+    if [[ "$LIST_SITES" == true ]]; then
+        cmd_list_sites
         exit "$EXIT_SUCCESS"
     fi
-    
+
+    if [[ "$REFRESH_SITES" == true ]]; then
+        cmd_refresh_sites
+        exit "$EXIT_SUCCESS"
+    fi
+
+    # Handle --list-aps and --refresh-aps commands
+    if [[ "$LIST_APS" == true ]]; then
+        cmd_list_aps
+        exit "$EXIT_SUCCESS"
+    fi
+
+    if [[ "$REFRESH_APS" == true ]]; then
+        cmd_refresh_aps
+        exit "$EXIT_SUCCESS"
+    fi
+
+    # Handle subcommands or MAC address
+    if [[ ${#positional_args[@]} -eq 0 ]]; then
+        # No arguments provided - assume we're trying to jump to the AP we're currently connected to
+        log_info "No target MAC address provided, looking for your devices Wi-Fi connection..."
+
+        local local_mac
+        if local_mac=$(get_local_wifi_mac); then
+            log_info "Detected local Wi-Fi MAC: $local_mac"
+            log_info ""
+            positional_args=("$local_mac")
+        else
+            echo "" >&2
+            echo "Not connected to Wi-Fi." >&2
+            echo "Run '$SCRIPT_NAME -h' for options." >&2
+            echo "" >&2
+            exit "$EXIT_ERROR"
+        fi
+    fi
+
     local first_arg="${positional_args[0]}"
-    
+
     if [[ "$first_arg" == "config" ]]; then
         # Config subcommand
-        cmd_config "${positional_args[@]:1}"
+        if [[ ${#positional_args[@]} -gt 1 ]]; then
+            cmd_config "${positional_args[@]:1}"
+        else
+            cmd_config
+        fi
     elif validate_mac "$first_arg"; then
-        # MAC address provided - parse any remaining options
-        local remaining_args=("${positional_args[@]:1}")
-        for arg in "${remaining_args[@]}"; do
-            case "$arg" in
-                -v|--verbose)
-                    VERBOSE=true
-                    ;;
-                -n|--dry-run)
-                    DRY_RUN=true
-                    ;;
-                -*)
-                    log_error "Unknown option: $arg"
-                    exit "$EXIT_ERROR"
-                    ;;
-            esac
-        done
-        cmd_mac "$first_arg"
+        # MAC/BSSID address provided - parse any remaining options
+        if [[ ${#positional_args[@]} -gt 1 ]]; then
+            local remaining_args=("${positional_args[@]:1}")
+            local i=0
+            while [[ $i -lt ${#remaining_args[@]} ]]; do
+                case "${remaining_args[$i]}" in
+                    -p|--profile)
+                        if [[ $((i + 1)) -ge ${#remaining_args[@]} ]]; then
+                            log_error "--profile requires a profile name"
+                            exit "$EXIT_ERROR"
+                        fi
+                        PROFILE="${remaining_args[$((i + 1))]}"
+                        i=$((i + 2))
+                        ;;
+                    --site)
+                        if [[ $((i + 1)) -ge ${#remaining_args[@]} ]]; then
+                            log_error "--site requires a site name"
+                            exit "$EXIT_ERROR"
+                        fi
+                        SITE_FILTER="${remaining_args[$((i + 1))]}"
+                        i=$((i + 2))
+                        ;;
+                    --site-id)
+                        if [[ $((i + 1)) -ge ${#remaining_args[@]} ]]; then
+                            log_error "--site-id requires a site ID"
+                            exit "$EXIT_ERROR"
+                        fi
+                        SITE_ID_FILTER="${remaining_args[$((i + 1))]}"
+                        i=$((i + 2))
+                        ;;
+                    --all)
+                        SHOW_ALL_SITES=true
+                        i=$((i + 1))
+                        ;;
+                    --verify)
+                        VERIFY_AP_STATUS=true
+                        i=$((i + 1))
+                        ;;
+                    -v|--verbose)
+                        VERBOSE=true
+                        i=$((i + 1))
+                        ;;
+                    -n|--dry-run)
+                        DRY_RUN=true
+                        VERBOSE=true
+                        i=$((i + 1))
+                        ;;
+                    -*)
+                        log_error "Unknown option: ${remaining_args[$i]}"
+                        exit "$EXIT_ERROR"
+                        ;;
+                    *)
+                        log_error "Unexpected argument: ${remaining_args[$i]}"
+                        exit "$EXIT_ERROR"
+                        ;;
+                esac
+            done
+        fi
+        cmd_lookup "$first_arg"
     else
         log_error "Invalid MAC address: $first_arg"
         log_error "Accepted formats: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff"
