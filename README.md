@@ -7,7 +7,7 @@ SSH into a New Central managed Aruba AP by client MAC or AP BSSID. That's it.
 ## Install
 
 ```bash
-curl -fsSL https://wifi.lol/ap-hop | bash
+curl -fsSL http://wifi.lol/ap-hop | bash
 ```
 
 The installer will:
