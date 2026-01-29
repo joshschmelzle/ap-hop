@@ -10,12 +10,11 @@ readonly INSTALL_DIR="$HOME/.local/bin"
 readonly SCRIPT_NAME="ap-hop"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/joshschmelzle/ap-hop/main/ap-hop"
 
-# ANSI color codes
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
+readonly NC='\033[0m' 
 
 info() {
     echo -e "${BLUE}➜${NC} $*"
@@ -33,17 +32,14 @@ error() {
     echo -e "${RED}✗${NC} $*" >&2
 }
 
-# Check if a command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Detect OS for dependency installation hints
 get_install_cmd() {
     local pkg="$1"
     
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS
         if [[ "$pkg" == "sshpass" ]]; then
             echo "brew install hudochenkov/sshpass/sshpass"
         else
@@ -62,13 +58,11 @@ get_install_cmd() {
     fi
 }
 
-# Check dependencies
 check_dependencies() {
     local missing=0
     
     info "Checking dependencies..."
     
-    # curl is critical - we need it to download
     if ! command_exists curl; then
         error "curl not found - required for installation"
         echo "  Install with: $(get_install_cmd curl)"
@@ -76,7 +70,6 @@ check_dependencies() {
     fi
     success "curl found"
     
-    # jq is required for runtime
     if ! command_exists jq; then
         warn "jq not found - required to run ap-hop"
         echo "  Install with: $(get_install_cmd jq)"
@@ -85,7 +78,6 @@ check_dependencies() {
         success "jq found"
     fi
     
-    # sshpass is required for runtime
     if ! command_exists sshpass; then
         warn "sshpass not found - required to run ap-hop"
         echo "  Install with: $(get_install_cmd sshpass)"
@@ -101,17 +93,14 @@ check_dependencies() {
     fi
 }
 
-# Download and install ap-hop
 install_script() {
     info "Installing ap-hop to $INSTALL_DIR..."
     
-    # Create directory if it doesn't exist
     if [[ ! -d "$INSTALL_DIR" ]]; then
         mkdir -p "$INSTALL_DIR"
         success "Created directory: $INSTALL_DIR"
     fi
     
-    # Download the script
     local temp_file
     temp_file=$(mktemp)
     
@@ -126,11 +115,9 @@ install_script() {
     fi
 }
 
-# Ensure ~/.local/bin is in PATH
 setup_path() {
     info "Checking PATH configuration..."
     
-    # Check if already in PATH
     case ":${PATH}:" in
         *:"$INSTALL_DIR":*)
             success "$INSTALL_DIR is already in PATH"
@@ -138,10 +125,8 @@ setup_path() {
             ;;
     esac
     
-    # Not in PATH, need to add it
     warn "$INSTALL_DIR is not in PATH"
     
-    # Detect shell and appropriate rc file
     local rc_file=""
     local shell_name="${SHELL##*/}"
     
@@ -165,7 +150,6 @@ setup_path() {
     
     info "Adding PATH configuration to $rc_file..."
     
-    # Add the PATH configuration with guard check
     cat >> "$rc_file" << 'EOF'
 
 # Add ~/.local/bin to PATH if not already present
@@ -180,11 +164,10 @@ EOF
     info "Restart your shell or run: source $rc_file"
 }
 
-# Main installation flow
 main() {
     echo ""
     echo "╔═══════════════════════════════════════╗"
-    echo "║         ap-hop installer              ║"
+    echo "║          ap-hop installer             ║"
     echo "╚═══════════════════════════════════════╝"
     echo ""
     
@@ -198,8 +181,7 @@ main() {
     echo ""
     echo "Next steps:"
     echo "  1. Restart your shell (or source your rc file)"
-    echo "  2. Run: ap-hop config"
-    echo "  3. Start hopping: ap-hop <mac-address>"
+    echo "  2. Run: ap-hop"
     echo ""
 }
 
