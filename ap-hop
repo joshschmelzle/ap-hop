@@ -10,7 +10,7 @@ set -euo pipefail
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Constants
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-readonly VERSION="0.0.3"
+readonly VERSION="0.0.4"
 readonly SCRIPT_NAME="ap-hop"
 readonly DEFAULT_SSH_USER="admin"
 readonly DEFAULT_SSH_TIMEOUT=10
@@ -429,7 +429,7 @@ fetch_and_cache_aps() {
 
     {
         echo "# APs cache for site: $site_name - $(date)"
-        echo "# Format: SERIAL|NAME|MAC|IP|BSSID1,BSSID2,BSSID3,..."
+        echo "# Format: SERIAL|NAME|MAC|IP|BSSID1,BSSID2,BSSID3,...|RADIOMAC1,RADIOMAC2,..."
 
         while IFS= read -r serial; do
             [[ -z "$serial" ]] && continue
@@ -452,10 +452,11 @@ fetch_and_cache_aps() {
                 continue
             }
 
-            local bssids
+            local bssids radio_macs
             bssids=$(echo "$ap_response" | jq -r '[.radios[]? | .wlans[]? | .bssid] | join(",")')
+            radio_macs=$(echo "$ap_response" | jq -r '[.radios[]? | .macAddress] | join(",")')
 
-            echo "${serial}|${name}|${mac}|${ip}|${bssids}"
+            echo "${serial}|${name}|${mac}|${ip}|${bssids}|${radio_macs}"
 
             processed=$((processed + 1))
 
@@ -496,11 +497,24 @@ find_serial_by_bssid_cached() {
     local normalized_bssid
     normalized_bssid=$(normalize_mac "$bssid")
 
-    while IFS='|' read -r serial name mac ip bssids; do
+    while IFS='|' read -r serial name mac ip bssids radio_macs; do
         [[ "$serial" =~ ^# ]] && continue
 
+        # Check AP base MAC first
+        if [[ "$mac" == "$normalized_bssid" ]]; then
+            echo "${serial}|${name}|${mac}|${ip}|APMAC"
+            return 0
+        fi
+
+        # Check BSSIDs
         if echo ",$bssids," | grep -q ",${normalized_bssid},"; then
-            echo "${serial}|${name}|${mac}|${ip}"
+            echo "${serial}|${name}|${mac}|${ip}|BSSID"
+            return 0
+        fi
+
+        # Check Radio MACs
+        if [[ -n "$radio_macs" ]] && echo ",$radio_macs," | grep -q ",${normalized_bssid},"; then
+            echo "${serial}|${name}|${mac}|${ip}|RADIOMAC"
             return 0
         fi
     done < <(grep -v '^#' "$cache_file")
@@ -1398,20 +1412,49 @@ try_last_found_site() {
         fi
     fi
 
-    # Try as BSSID if we have cached APs for this site
+    # Try as BSSID/Radio MAC/AP MAC if we have cached APs for this site
     if is_aps_cache_valid "$last_site_id" "$last_site_name"; then
         local cache_file
         cache_file=$(get_aps_cache_file "$last_site_id" "$last_site_name")
 
-        local found_line
-        found_line=$(grep -i "$mac" "$cache_file" 2>/dev/null | grep -v '^#' | head -n1)
+        # Search using the same logic as find_serial_by_bssid_cached
+        local found=false
+        local found_serial found_match_type
+        while IFS='|' read -r serial name ap_mac ip bssids radio_macs; do
+            [[ "$serial" =~ ^# ]] && continue
 
-        if [[ -n "$found_line" ]]; then
-            # Found as BSSID!
-            AP_SERIAL=$(echo "$found_line" | cut -d'|' -f1)
+            # Check AP base MAC first
+            if [[ "$ap_mac" == "$mac" ]]; then
+                found=true
+                found_serial="$serial"
+                found_match_type="APMAC"
+                break
+            fi
+
+            # Check BSSIDs
+            if echo ",$bssids," | grep -q ",${mac},"; then
+                found=true
+                found_serial="$serial"
+                found_match_type="BSSID"
+                break
+            fi
+
+            # Check Radio MACs
+            if [[ -n "$radio_macs" ]] && echo ",$radio_macs," | grep -q ",${mac},"; then
+                found=true
+                found_serial="$serial"
+                found_match_type="RADIOMAC"
+                break
+            fi
+        done < <(grep -v '^#' "$cache_file")
+
+        if [[ "$found" == true ]]; then
+            # Found!
+            AP_SERIAL="$found_serial"
             SITE_ID="$last_site_id"
             SITE_NAME="$last_site_name"
-            log_verbose "Found in last location (as BSSID)"
+            MATCH_TYPE="$found_match_type"
+            log_verbose "Found in last location (as $found_match_type)"
             return 0
         fi
     fi
@@ -1457,6 +1500,7 @@ auto_search_all_sites() {
         local site_id="${SITE_IDS[$i]}"
         local site_name="${SITE_NAMES[$i]}"
         local client_count="${SITE_CLIENT_COUNTS[$i]}"
+        local device_count="${SITE_DEVICE_COUNTS[$i]}"
 
         # Skip sites with 0 clients
         if [[ "$client_count" -eq 0 ]]; then
@@ -1472,7 +1516,7 @@ auto_search_all_sites() {
         if [[ "$show_progress" == true ]]; then
             local mins=$((elapsed / 60))
             local secs=$((elapsed % 60))
-            log_info "$(printf '[%02d:%02d]' $mins $secs) Checking site '$site_name' ($client_count clients)..."
+            log_info "$(printf '[%02d:%02d]' $mins $secs) Checking site '$site_name' ($client_count clients, $device_count APs)..."
         fi
 
         # Try to find client
@@ -1510,14 +1554,22 @@ auto_search_all_sites() {
         local site_name="${SITE_NAMES[$i]}"
         local device_count="${SITE_DEVICE_COUNTS[$i]}"
 
-        # Skip sites with 0 devices and 0 clients
-        if [[ "$device_count" -eq 0 && "${SITE_CLIENT_COUNTS[$i]}" -eq 0 ]]; then
+        # Skip sites with 0 devices (no APs = no BSSIDs)
+        if [[ "$device_count" -eq 0 ]]; then
             continue
         fi
 
-        # Only search if AP cache exists
+        # Build AP cache if needed
         if ! is_aps_cache_valid "$site_id" "$site_name"; then
-            continue
+            local elapsed=$(($(date +%s) - start_time))
+            if [[ $elapsed -ge 3 ]]; then
+                show_progress=true
+            fi
+
+            if [[ "$show_progress" == true ]]; then
+                log_info "Building AP cache for '$site_name' ($device_count APs)..."
+            fi
+            fetch_and_cache_aps "$site_id" "$site_name"
         fi
 
         local elapsed=$(($(date +%s) - start_time))
@@ -1528,23 +1580,52 @@ auto_search_all_sites() {
         if [[ "$show_progress" == true ]]; then
             local mins=$((elapsed / 60))
             local secs=$((elapsed % 60))
-            log_info "$(printf '[%02d:%02d]' $mins $secs) Checking APs in '$site_name'..."
+            log_info "$(printf '[%02d:%02d]' $mins $secs) Checking APs in '$site_name' ($device_count APs)..."
         fi
 
         local cache_file
         cache_file=$(get_aps_cache_file "$site_id" "$site_name")
 
-        local found_line
-        found_line=$(grep -i "$mac" "$cache_file" 2>/dev/null | grep -v '^#' | head -n1)
+        # Search using the same logic as find_serial_by_bssid_cached
+        local found=false
+        local found_serial found_match_type
+        while IFS='|' read -r serial name ap_mac ip bssids radio_macs; do
+            [[ "$serial" =~ ^# ]] && continue
 
-        if [[ -n "$found_line" ]]; then
+            # Check AP base MAC first
+            if [[ "$ap_mac" == "$mac" ]]; then
+                found=true
+                found_serial="$serial"
+                found_match_type="APMAC"
+                break
+            fi
+
+            # Check BSSIDs
+            if echo ",$bssids," | grep -q ",${mac},"; then
+                found=true
+                found_serial="$serial"
+                found_match_type="BSSID"
+                break
+            fi
+
+            # Check Radio MACs
+            if [[ -n "$radio_macs" ]] && echo ",$radio_macs," | grep -q ",${mac},"; then
+                found=true
+                found_serial="$serial"
+                found_match_type="RADIOMAC"
+                break
+            fi
+        done < <(grep -v '^#' "$cache_file")
+
+        if [[ "$found" == true ]]; then
             # Found!
             kill $progress_pid 2>/dev/null
             wait $progress_pid 2>/dev/null
 
-            AP_SERIAL=$(echo "$found_line" | cut -d'|' -f1)
+            AP_SERIAL="$found_serial"
             SITE_ID="$site_id"
             SITE_NAME="$site_name"
+            MATCH_TYPE="$found_match_type"
 
             if [[ "$show_progress" == true ]]; then
                 local mins=$((elapsed / 60))
@@ -1703,8 +1784,8 @@ get_serial_by_bssid() {
         return 1
     }
 
-    local serial name mac ip
-    IFS='|' read -r serial name mac ip <<< "$result"
+    local serial name mac ip match_type
+    IFS='|' read -r serial name mac ip match_type <<< "$result"
 
     if [[ "$VERIFY_AP_STATUS" == true ]]; then
         echo "Verifying AP status..." >&2
@@ -1732,6 +1813,7 @@ get_serial_by_bssid() {
     AP_NAME="$name"
     AP_MAC="$mac"
     AP_IP="$ip"
+    MATCH_TYPE="$match_type"
 
     echo "$serial"
     return 0
@@ -1963,7 +2045,8 @@ cmd_lookup() {
                         exit "$EXIT_API_ERROR"
                     fi
                 elif [[ "$response" =~ ^[Mm]$ ]]; then
-                    # Manual site selection
+                    # Manual site selection - show all sites
+                    SHOW_ALL_SITES=true
                     select_site
 
                     if [[ "$SELECTED_SITE_ID" == "__REFRESH__" ]]; then
@@ -2102,6 +2185,10 @@ cmd_lookup() {
 
     if [[ "$lookup_method" == "MAC" ]]; then
         log_info "Client found on AP: $ap_name ($ap_mac) at $ap_ip"
+    elif [[ "${MATCH_TYPE:-}" == "RADIOMAC" ]]; then
+        log_info "Radio MAC found on AP: $ap_name ($ap_mac) at $ap_ip"
+    elif [[ "${MATCH_TYPE:-}" == "APMAC" ]]; then
+        log_info "AP MAC found on AP: $ap_name ($ap_mac) at $ap_ip"
     else
         log_info "BSSID found on AP: $ap_name ($ap_mac) at $ap_ip"
     fi

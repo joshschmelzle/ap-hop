@@ -20,7 +20,7 @@ Yes, we're curling bash scripts from the Internet. This is the way.
 
 ## Setup
 
-Generate API client for the service (cluster) where your APs are: https://common.cloud.hpe.com/manage-account/api
+Generate an API client for the service (cluster) where your APs are: https://common.cloud.hpe.com/manage-account/api
 
 You need the client ID and secret.
 
