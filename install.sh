@@ -38,7 +38,7 @@ command_exists() {
 
 get_install_cmd() {
     local pkg="$1"
-    
+
     if [[ "$OSTYPE" == "darwin"* ]]; then
         if [[ "$pkg" == "sshpass" ]]; then
             echo "brew install hudochenkov/sshpass/sshpass"
@@ -60,16 +60,16 @@ get_install_cmd() {
 
 check_dependencies() {
     local missing=0
-    
+
     info "Checking dependencies..."
-    
+
     if ! command_exists curl; then
         error "curl not found - required for installation"
         echo "  Install with: $(get_install_cmd curl)"
         exit 1
     fi
     success "curl found"
-    
+
     if ! command_exists jq; then
         warn "jq not found - required to run ap-hop"
         echo "  Install with: $(get_install_cmd jq)"
@@ -77,7 +77,7 @@ check_dependencies() {
     else
         success "jq found"
     fi
-    
+
     if ! command_exists sshpass; then
         warn "sshpass not found - required to run ap-hop"
         echo "  Install with: $(get_install_cmd sshpass)"
@@ -85,7 +85,7 @@ check_dependencies() {
     else
         success "sshpass found"
     fi
-    
+
     if [[ $missing -eq 1 ]]; then
         echo ""
         warn "Missing dependencies detected. Install them before using ap-hop."
@@ -95,15 +95,15 @@ check_dependencies() {
 
 install_script() {
     info "Installing ap-hop to $INSTALL_DIR..."
-    
+
     if [[ ! -d "$INSTALL_DIR" ]]; then
         mkdir -p "$INSTALL_DIR"
         success "Created directory: $INSTALL_DIR"
     fi
-    
+
     local temp_file
     temp_file=$(mktemp)
-    
+
     if curl -fsSL "$SCRIPT_URL" -o "$temp_file"; then
         mv "$temp_file" "$INSTALL_DIR/$SCRIPT_NAME"
         chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
@@ -115,21 +115,35 @@ install_script() {
     fi
 }
 
+clear_caches() {
+    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ap-hop"
+
+    if [[ -d "$config_dir" ]]; then
+        local cache_count
+        cache_count=$(find "$config_dir" -name "aps_cache_*" -type f 2>/dev/null | wc -l | xargs)
+
+        if [[ $cache_count -gt 0 ]]; then
+            find "$config_dir" -name "aps_cache_*" -type f -delete 2>/dev/null
+            success "Cleared $cache_count AP cache(s)"
+        fi
+    fi
+}
+
 setup_path() {
     info "Checking PATH configuration..."
-    
+
     case ":${PATH}:" in
         *:"$INSTALL_DIR":*)
             success "$INSTALL_DIR is already in PATH"
             return 0
             ;;
     esac
-    
+
     warn "$INSTALL_DIR is not in PATH"
-    
+
     local rc_file=""
     local shell_name="${SHELL##*/}"
-    
+
     case "$shell_name" in
         bash)
             if [[ -f "$HOME/.bashrc" ]]; then
@@ -147,9 +161,9 @@ setup_path() {
             rc_file="$HOME/.profile"
             ;;
     esac
-    
+
     info "Adding PATH configuration to $rc_file..."
-    
+
     cat >> "$rc_file" << 'EOF'
 
 # Add ~/.local/bin to PATH if not already present
@@ -158,7 +172,7 @@ case ":${PATH}:" in
     *) export PATH="$HOME/.local/bin:$PATH" ;;
 esac
 EOF
-    
+
     success "Added $INSTALL_DIR to PATH in $rc_file"
     echo ""
     info "Restart your shell or run: source $rc_file"
@@ -170,10 +184,12 @@ main() {
     echo "║          ap-hop installer             ║"
     echo "╚═══════════════════════════════════════╝"
     echo ""
-    
+
     check_dependencies
     echo ""
     install_script
+    echo ""
+    clear_caches
     echo ""
     setup_path
     echo ""
