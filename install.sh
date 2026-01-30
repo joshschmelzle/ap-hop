@@ -135,7 +135,8 @@ setup_path() {
     case ":${PATH}:" in
         *:"$INSTALL_DIR":*)
             success "$INSTALL_DIR is already in PATH"
-            return 1
+            echo "0"
+            return 0
             ;;
     esac
 
@@ -176,6 +177,7 @@ EOF
     success "Added $INSTALL_DIR to PATH in $rc_file"
     echo ""
     info "Restart your shell or run: source $rc_file"
+    echo "1"
     return 0
 }
 
@@ -192,12 +194,15 @@ main() {
     echo ""
     clear_caches
     echo ""
-    setup_path
-    local path_modified=$?
+    local path_modified
+    path_modified=$(setup_path)
     echo ""
     success "Installation complete!"
+
+    echo "Generate an API client for the service (cluster) where your APs are over at https://common.cloud.hpe.com/manage-account/api"
+    echo "You need the client ID and secret for the initial setup."
     echo ""
-    if [[ $path_modified -eq 0 ]]; then
+    if [[ "$path_modified" == "1" ]]; then
         echo "Next steps:"
         echo "  1. Restart your shell (or source your rc file)"
         echo "  2. Run: ap-hop"
