@@ -191,14 +191,12 @@ main() {
     check_dependencies
     echo ""
     install_script
-    echo ""
     clear_caches
-    echo ""
     local path_modified
     path_modified=$(setup_path)
     echo ""
     success "Installation complete!"
-
+    echo ""
     echo "Generate an API client for the service (cluster) where your APs are over at https://common.cloud.hpe.com/manage-account/api"
     echo "You need the client ID and secret for the initial setup."
     echo ""
