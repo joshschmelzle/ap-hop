@@ -20,15 +20,11 @@ Yes, we're curling bash scripts from the Internet. This is the way.
 
 ## Setup
 
-Generate an API client for the service (cluster) where your APs are: https://common.cloud.hpe.com/manage-account/api
+Generate an [API client](https://common.cloud.hpe.com/manage-account/api) for the service (cluster) where your APs are.
 
-You need the client ID and secret.
+On first run, a config wizard will ask for your client ID and secret. It only asks once.
 
-```bash
-ap-hop
-```
-
-On first run without a profile, a config wizard will ask you questions. It only asks once.
+To reconfigure later:
 
 ```bash
 ap-hop config
@@ -42,7 +38,7 @@ Your own Wi-Fi MAC:
 ap-hop
 ```
 
-The script will figure out which AP you're yelling at.
+The script will figure out which AP you're connected to.
 
 Magic? No. AI? No. `iw` or `ifconfig` parsing? Yes.
 
