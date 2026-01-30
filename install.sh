@@ -135,7 +135,7 @@ setup_path() {
     case ":${PATH}:" in
         *:"$INSTALL_DIR":*)
             success "$INSTALL_DIR is already in PATH"
-            return 0
+            return 1
             ;;
     esac
 
@@ -176,6 +176,7 @@ EOF
     success "Added $INSTALL_DIR to PATH in $rc_file"
     echo ""
     info "Restart your shell or run: source $rc_file"
+    return 0
 }
 
 main() {
@@ -192,12 +193,18 @@ main() {
     clear_caches
     echo ""
     setup_path
+    local path_modified=$?
     echo ""
     success "Installation complete!"
     echo ""
-    echo "Next steps:"
-    echo "  1. Restart your shell (or source your rc file)"
-    echo "  2. Run: ap-hop"
+    if [[ $path_modified -eq 0 ]]; then
+        echo "Next steps:"
+        echo "  1. Restart your shell (or source your rc file)"
+        echo "  2. Run: ap-hop"
+    else
+        echo "Next steps:"
+        echo "  1. Run: ap-hop"
+    fi
     echo ""
 }
 
