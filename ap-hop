@@ -7,10 +7,11 @@
 
 set -euo pipefail
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Constants
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Constants
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-readonly VERSION="0.0.4"
+readonly VERSION="0.0.5"
 readonly SCRIPT_NAME="ap-hop"
 readonly DEFAULT_SSH_USER="admin"
 readonly DEFAULT_SSH_TIMEOUT=10
@@ -103,6 +104,23 @@ check_dependencies() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Missing required dependencies: ${missing[*]}"
         log_error "Please install them and try again."
+        exit "$EXIT_DEPENDENCY_ERROR"
+    fi
+}
+
+check_expect_dependency() {
+    if ! command -v expect &>/dev/null; then
+        log_error "Missing required dependency: expect"
+        log_error "Please install it and try again."
+        log_error "  Ubuntu/Debian: sudo apt-get install expect"
+        log_error "  macOS: brew install expect"
+        log_error "  Fedora: sudo dnf install expect"
+        exit "$EXIT_DEPENDENCY_ERROR"
+    fi
+
+    if ! command -v aruba-token-decoder &>/dev/null; then
+        log_error "Missing required dependency: aruba-token-decoder"
+        log_error "Please ensure aruba-token-decoder is in your PATH."
         exit "$EXIT_DEPENDENCY_ERROR"
     fi
 }
@@ -1877,6 +1895,123 @@ ssh_to_ap() {
     return $ssh_exit_code
 }
 
+shell_to_ap() {
+    local ip="$1"
+    local password="$2"
+    local timeout
+    timeout=$(get_ssh_timeout)
+
+    log_info "Connecting and escalating to root shell..."
+    log_verbose "Using expect to automate su workflow"
+
+    # Create temp expect script file
+    local expect_script_file
+    expect_script_file=$(mktemp)
+
+    cat > "$expect_script_file" << 'EXPECT_EOF'
+#!/usr/bin/env expect
+
+set ip [lindex $argv 0]
+set user [lindex $argv 1]
+set password [lindex $argv 2]
+set timeout_val [lindex $argv 3]
+
+# Set timeout
+set timeout $timeout_val
+
+# SSH to AP
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$timeout_val -o LogLevel=ERROR $user@$ip
+
+# Handle SSH password prompt
+expect {
+    "password:" {
+        send "$password\r"
+    }
+    timeout {
+        puts stderr "Error: SSH connection timeout"
+        exit 1
+    }
+    eof {
+        puts stderr "Error: SSH connection failed"
+        exit 1
+    }
+}
+
+# Wait for prompt
+expect {
+    -re {[$#>] } {
+        # Successfully logged in
+    }
+    timeout {
+        puts stderr "Error: Timeout waiting for prompt"
+        exit 1
+    }
+}
+
+# Run su command
+send "su\r"
+
+# Handle su prompts
+expect {
+    "Username" {
+        send "neo\r"
+        exp_continue
+    }
+    -re {Token: ([A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})} {
+        set token $expect_out(1,string)
+        puts stderr "Token detected: $token"
+
+        # Generate password using aruba-token-decoder
+        set support_access [exec aruba-token-decoder neo $token]
+        puts stderr "Generated support password"
+
+        # Wait for password prompt and send it
+        expect "Support Password:"
+        send "$support_access\r"
+    }
+    timeout {
+        puts stderr "Error: Timeout during su command"
+        exit 1
+    }
+}
+
+# Wait for root prompt and verify
+expect {
+    -re {[$#] } {
+        send "whoami\r"
+    }
+    timeout {
+        puts stderr "Error: Timeout waiting for root prompt"
+        exit 1
+    }
+}
+
+# Check whoami output
+expect {
+    "root" {
+        send "# I\'m in\r"
+    }
+    timeout {
+        puts stderr "Error: could not verify root access"
+    }
+}
+
+# Interact with user
+interact
+EXPECT_EOF
+
+    chmod +x "$expect_script_file"
+
+    # Execute expect script with arguments
+    "$expect_script_file" "$ip" "$SSH_USER" "$password" "$timeout"
+    local exit_code=$?
+
+    # Clean up temp file
+    rm -f "$expect_script_file"
+
+    return $exit_code
+}
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Main workflow
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1887,7 +2022,7 @@ cmd_lookup() {
     # Validate input is MAC/BSSID format
     if ! validate_mac "$input"; then
         log_error "Invalid MAC/BSSID format: $input"
-        log_error "Accepted formats: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff"
+        log_error "Accepted formats: de:ad:be:ef:de:ad, de-ad-be-ef-de-ad, deadbeefdead"
         exit "$EXIT_VALIDATION_ERROR"
     fi
 
@@ -2220,6 +2355,127 @@ cmd_lookup() {
     fi
 }
 
+# ~~~~~~~~~~~~~~~~
+# Shell subcommand
+# ~~~~~~~~~~~~~~~~
+
+cmd_shell() {
+    local input="$1"
+
+    # Validate input is MAC/BSSID format
+    if ! validate_mac "$input"; then
+        log_error "Invalid MAC/BSSID format: $input"
+        log_error "Accepted formats: de:ad:be:ef:de:ad, de-ad-be-ef-de-ad, deadbeefdead"
+        exit "$EXIT_VALIDATION_ERROR"
+    fi
+
+    # Check for expect dependency
+    check_expect_dependency
+
+    local normalized_input
+    normalized_input=$(normalize_mac "$input")
+
+    # Load profile
+    CURRENT_PROFILE="${PROFILE:-$(get_default_profile)}"
+    load_profile "$CURRENT_PROFILE"
+
+    log_verbose "Using profile: $CURRENT_PROFILE"
+    log_verbose "Cluster: $CLUSTER ($CLUSTER_URL)"
+
+    # Check site cache
+    if ! is_sites_cache_valid; then
+        log_info "Site cache expired or missing, fetching sites..."
+        if ! fetch_and_cache_sites "$CURRENT_PROFILE"; then
+            log_error "Failed to fetch sites from API"
+            exit "$EXIT_API_ERROR"
+        fi
+    fi
+
+    # Load sites
+    if ! load_cached_sites; then
+        log_error "Failed to load sites cache"
+        exit "$EXIT_ERROR"
+    fi
+
+    # Search for MAC/BSSID
+    local site_id site_name ap_serial
+    site_id=""
+    site_name=""
+    ap_serial=""
+
+    # Try last found site first
+    local last_site_id last_site_name
+    last_site_id=$(get_last_found_site_id "$CURRENT_PROFILE")
+    last_site_name=$(get_last_found_site_name "$CURRENT_PROFILE")
+
+    if [[ -n "$last_site_id" && -n "$last_site_name" ]]; then
+        if try_last_found_site "$normalized_input" "$last_site_id" "$last_site_name"; then
+            update_last_found_site "$CURRENT_PROFILE" "$SITE_ID" "$SITE_NAME"
+            site_id="$SITE_ID"
+            site_name="$SITE_NAME"
+            ap_serial="$AP_SERIAL"
+            log_info "Found in last location: $site_name"
+        fi
+    fi
+
+    # Auto-search if not found
+    if [[ -z "$site_id" ]]; then
+        if auto_search_all_sites "$normalized_input"; then
+            update_last_found_site "$CURRENT_PROFILE" "$SITE_ID" "$SITE_NAME"
+            site_id="$SITE_ID"
+            site_name="$SITE_NAME"
+            ap_serial="$AP_SERIAL"
+            log_info "Found in site: $site_name"
+        else
+            log_error "MAC address $normalized_input not found in any site"
+            exit "$EXIT_API_ERROR"
+        fi
+    fi
+
+    # Get AP details
+    local ap_response ap_name ap_mac ap_ip ap_status
+    if ! ap_response=$(get_ap_by_serial "$ap_serial"); then
+        log_error "Failed to look up AP $ap_serial"
+        exit "$EXIT_API_ERROR"
+    fi
+
+    ap_name=$(echo "$ap_response" | jq -r '.deviceName // "Unknown"')
+    ap_mac=$(echo "$ap_response" | jq -r '.macAddress // "Unknown"')
+    ap_ip=$(echo "$ap_response" | jq -r '.ipv4 // empty')
+    ap_status=$(echo "$ap_response" | jq -r '.status // "Unknown"')
+
+    if [[ -z "$ap_ip" ]]; then
+        log_error "AP found but no IP address available"
+        exit "$EXIT_API_ERROR"
+    fi
+
+    log_info "AP: $ap_name ($ap_mac) at $ap_ip"
+
+    if [[ "$ap_status" == "Down" ]]; then
+        log_info "WARNING: AP status is 'Down'"
+        log_info "Attempting connection anyway..."
+    fi
+
+    # Dry run check
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "Dry run - would connect and escalate to root shell"
+        exit "$EXIT_SUCCESS"
+    fi
+
+    # Get SSH password
+    local password
+    password=$(get_ssh_password)
+
+    if [[ -z "$password" ]]; then
+        log_error "No SSH password provided"
+        exit "$EXIT_SSH_ERROR"
+    fi
+
+    if ! shell_to_ap "$ap_ip" "$password"; then
+        exit "$EXIT_SSH_ERROR"
+    fi
+}
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Site management commands
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2427,7 +2683,7 @@ USAGE:
     $SCRIPT_NAME --refresh-aps --site <name>
 
 ARGUMENTS:
-    <mac|bssid>    Client MAC address or BSSID (aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, or aabbccddeeff)
+    <mac|bssid>    Client MAC address or BSSID (de:ad:be:ef:de:ad, de-ad-be-ef-de-ad, or deadbeefdead)
                    If omitted, automatically detects and uses your devices Wi-Fi MAC address
 
 GLOBAL OPTIONS:
@@ -2453,6 +2709,15 @@ MAC LOOKUP OPTIONS (used after MAC address):
 Note: --site and --site-id can be used before or after MAC address, and also work with
       cache commands (--list-aps, --refresh-aps)
 
+SHELL SUBCOMMAND (requires 'expect'):
+    $SCRIPT_NAME shell <mac|bssid>                    SSH and auto-escalate to root
+                                                      Automatically handles su workflow:
+                                                      - Runs 'su' command
+                                                      - Enters username 'a'
+                                                      - Parses token from AP
+                                                      - Generates support password
+                                                      - Escalates to root shell
+
 CONFIG SUBCOMMAND:
     $SCRIPT_NAME config                               Interactive setup
     $SCRIPT_NAME config --profile <name>              Configure named profile
@@ -2464,24 +2729,24 @@ CONFIG SUBCOMMAND:
 EXAMPLES:
     # Basic lookup
     $SCRIPT_NAME                                      # Auto-detect local Wi-Fi
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff                    # Interactive site selection
+    $SCRIPT_NAME de:ad:be:ef:de:ad                    # Interactive site selection
 
     # BSSID lookup
     $SCRIPT_NAME 68:51:34:7c:32:10                   # BSSID lookup
     $SCRIPT_NAME 68:51:34:7c:32:10 --verify          # With API verification
 
     # Site selection
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --site "Twede's Cafe"
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --site-id 51101706940
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --all             # Show all sites including empty ones
+    $SCRIPT_NAME de:ad:be:ef:de:ad --site "Twede's Cafe"
+    $SCRIPT_NAME de:ad:be:ef:de:ad --site-id 51101706940
+    $SCRIPT_NAME de:ad:be:ef:de:ad --all             # Show all sites including empty ones
 
     # Profile and options
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --profile prod
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --verbose         # Show API responses
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --dry-run         # Test without SSH
+    $SCRIPT_NAME de:ad:be:ef:de:ad --profile prod
+    $SCRIPT_NAME de:ad:be:ef:de:ad --verbose         # Show API responses
+    $SCRIPT_NAME de:ad:be:ef:de:ad --dry-run         # Test without SSH
 
     # Combining options (flags after MAC address)
-    $SCRIPT_NAME aa:bb:cc:dd:ee:ff --site "The Grid" --profile prod --verbose
+    $SCRIPT_NAME de:ad:be:ef:de:ad --site "The Grid" --profile prod --verbose
 
     # Site and AP cache management
     $SCRIPT_NAME --list-sites                        # Show available sites
@@ -2534,6 +2799,86 @@ EXAMPLES:
     $SCRIPT_NAME config --delete --profile old       # Delete 'old' profile
 
 EOF
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Option parsing helper
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Parse options from an array and set global variables
+# Returns the number of arguments consumed
+parse_options() {
+    local -n args=$1
+    local i=0
+    local consumed=0
+
+    while [[ $i -lt ${#args[@]} ]]; do
+        case "${args[$i]}" in
+            -p|--profile)
+                if [[ $((i + 1)) -ge ${#args[@]} ]]; then
+                    log_error "--profile requires a profile name"
+                    exit "$EXIT_ERROR"
+                fi
+                PROFILE="${args[$((i + 1))]}"
+                i=$((i + 2))
+                consumed=$((consumed + 2))
+                ;;
+            --site)
+                if [[ $((i + 1)) -ge ${#args[@]} ]]; then
+                    log_error "--site requires a site name"
+                    exit "$EXIT_ERROR"
+                fi
+                SITE_FILTER="${args[$((i + 1))]}"
+                i=$((i + 2))
+                consumed=$((consumed + 2))
+                ;;
+            --site-id)
+                if [[ $((i + 1)) -ge ${#args[@]} ]]; then
+                    log_error "--site-id requires a site ID"
+                    exit "$EXIT_ERROR"
+                fi
+                SITE_ID_FILTER="${args[$((i + 1))]}"
+                i=$((i + 2))
+                consumed=$((consumed + 2))
+                ;;
+            --all)
+                SHOW_ALL_SITES=true
+                i=$((i + 1))
+                consumed=$((consumed + 1))
+                ;;
+            --verify)
+                VERIFY_AP_STATUS=true
+                i=$((i + 1))
+                consumed=$((consumed + 1))
+                ;;
+            --non-interactive)
+                NON_INTERACTIVE=true
+                i=$((i + 1))
+                consumed=$((consumed + 1))
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                i=$((i + 1))
+                consumed=$((consumed + 1))
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                VERBOSE=true
+                i=$((i + 1))
+                consumed=$((consumed + 1))
+                ;;
+            -*)
+                log_error "Unknown option: ${args[$i]}"
+                exit "$EXIT_ERROR"
+                ;;
+            *)
+                # Not an option, stop parsing
+                break
+                ;;
+        esac
+    done
+
+    return $consumed
 }
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2621,12 +2966,11 @@ main() {
                 break
                 ;;
             -*)
-                # Unknown option - might be for subcommand, collect remaining args
-                positional_args+=("$@")
-                break
+                log_error "Unknown option: $1"
+                exit "$EXIT_ERROR"
                 ;;
             *)
-                # First positional argument found - collect it and all remaining args
+                # Positional argument found - collect it and all remaining args
                 positional_args+=("$@")
                 break
                 ;;
@@ -2691,73 +3035,45 @@ main() {
         else
             cmd_config
         fi
+    elif [[ "$first_arg" == "shell" ]]; then
+        # Shell subcommand
+        local shell_mac=""
+
+        if [[ ${#positional_args[@]} -lt 2 ]]; then
+            # No MAC provided - auto-detect like main command
+            log_info "No target MAC address provided, looking for your devices Wi-Fi connection..."
+
+            if shell_mac=$(get_local_wifi_mac); then
+                log_info "Detected local Wi-Fi MAC: $shell_mac"
+                log_info ""
+            else
+                echo "" >&2
+                echo "Not connected to Wi-Fi." >&2
+                echo "Usage: $SCRIPT_NAME shell <mac|bssid>" >&2
+                echo "Run '$SCRIPT_NAME -h' for options." >&2
+                echo "" >&2
+                exit "$EXIT_ERROR"
+            fi
+        else
+            shell_mac="${positional_args[1]}"
+            # Parse any options after the MAC address
+            if [[ ${#positional_args[@]} -gt 2 ]]; then
+                local remaining_args=("${positional_args[@]:2}")
+                parse_options remaining_args
+            fi
+        fi
+
+        cmd_shell "$shell_mac"
     elif validate_mac "$first_arg"; then
-        # MAC/BSSID address provided - parse any remaining options
+        # MAC/BSSID address provided - parse any options after it
         if [[ ${#positional_args[@]} -gt 1 ]]; then
             local remaining_args=("${positional_args[@]:1}")
-            local i=0
-            while [[ $i -lt ${#remaining_args[@]} ]]; do
-                case "${remaining_args[$i]}" in
-                    -p|--profile)
-                        if [[ $((i + 1)) -ge ${#remaining_args[@]} ]]; then
-                            log_error "--profile requires a profile name"
-                            exit "$EXIT_ERROR"
-                        fi
-                        PROFILE="${remaining_args[$((i + 1))]}"
-                        i=$((i + 2))
-                        ;;
-                    --site)
-                        if [[ $((i + 1)) -ge ${#remaining_args[@]} ]]; then
-                            log_error "--site requires a site name"
-                            exit "$EXIT_ERROR"
-                        fi
-                        SITE_FILTER="${remaining_args[$((i + 1))]}"
-                        i=$((i + 2))
-                        ;;
-                    --site-id)
-                        if [[ $((i + 1)) -ge ${#remaining_args[@]} ]]; then
-                            log_error "--site-id requires a site ID"
-                            exit "$EXIT_ERROR"
-                        fi
-                        SITE_ID_FILTER="${remaining_args[$((i + 1))]}"
-                        i=$((i + 2))
-                        ;;
-                    --all)
-                        SHOW_ALL_SITES=true
-                        i=$((i + 1))
-                        ;;
-                    --verify)
-                        VERIFY_AP_STATUS=true
-                        i=$((i + 1))
-                        ;;
-                    --non-interactive)
-                        NON_INTERACTIVE=true
-                        i=$((i + 1))
-                        ;;
-                    -v|--verbose)
-                        VERBOSE=true
-                        i=$((i + 1))
-                        ;;
-                    -n|--dry-run)
-                        DRY_RUN=true
-                        VERBOSE=true
-                        i=$((i + 1))
-                        ;;
-                    -*)
-                        log_error "Unknown option: ${remaining_args[$i]}"
-                        exit "$EXIT_ERROR"
-                        ;;
-                    *)
-                        log_error "Unexpected argument: ${remaining_args[$i]}"
-                        exit "$EXIT_ERROR"
-                        ;;
-                esac
-            done
+            parse_options remaining_args
         fi
         cmd_lookup "$first_arg"
     else
         log_error "Invalid MAC address: $first_arg"
-        log_error "Accepted formats: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff"
+        log_error "Accepted formats: de:ad:be:ef:de:ad, de-ad-be-ef-de-ad, deadbeefdead"
         exit "$EXIT_VALIDATION_ERROR"
     fi
 }

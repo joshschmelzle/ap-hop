@@ -60,11 +60,9 @@ For when you forget everything.
 
 ## Dependencies
 
-`curl`, `jq`, `sshpass`. You probably have two of these.
+`expect`, `curl`, `jq`, `sshpass`. You probably have two of these.
 
 Should work on Linux and macOS.
-
- - brew install sshpass jq
 
 Windows users: Good news! WSL2 lets you pretend you're on a real operating system.
 
