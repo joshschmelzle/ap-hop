@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # ap-hop - Aruba New Central "Jump-to-AP" SSH tool
 #
 # Quickly "hop" into the access point by providing a client MAC or AP BSSID
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 set -euo pipefail
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~
 # Constants
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~
 
-readonly VERSION="0.0.5"
+readonly VERSION="0.0.6"
 readonly SCRIPT_NAME="ap-hop"
 readonly DEFAULT_SSH_USER="admin"
 readonly DEFAULT_SSH_TIMEOUT=10
@@ -45,9 +45,9 @@ APAC-East1|https://jp1.api.central.arubanetworks.com|Public
 APAC-South1|https://au1.api.central.arubanetworks.com|Public
 UAE-North1|https://ae1.api.central.arubanetworks.com|Public'
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~
 # Global variables
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~
 
 VERBOSE=false
 DRY_RUN=false
@@ -69,9 +69,9 @@ LIST_APS=false
 REFRESH_APS=false
 SHOW_ALL_SITES=false
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~
 # Utility functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~
 
 get_config_dir() {
     echo "${XDG_CONFIG_HOME:-$HOME/.config}/$SCRIPT_NAME"
@@ -159,9 +159,9 @@ EOF
     fi
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~
 # Site cache functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~
 
 get_sites_cache_file() {
     echo "$CONFIG_DIR/sites_cache"
@@ -349,9 +349,9 @@ sanitize_site_name() {
     echo "$site_name" | tr ' ' '_' | sed 's/[^a-zA-Z0-9_-]//g'
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~
 # AP cache functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~
 
 get_aps_cache_file() {
     local site_id="$1"
@@ -540,9 +540,9 @@ find_serial_by_bssid_cached() {
     return 1
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~
 # INI file functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~
 
 read_ini_value() {
     local file="$1"
@@ -651,9 +651,9 @@ delete_ini_section() {
     mv "$temp_file" "$file"
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~
 # Profile functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~
 
 get_default_profile() {
     local default
@@ -681,9 +681,9 @@ get_ssh_timeout() {
     echo "${timeout:-$DEFAULT_SSH_TIMEOUT}"
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Last found site tracking (for fast-path optimization)
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 get_last_found_site_id() {
     local profile="$1"
@@ -709,10 +709,9 @@ update_last_found_site() {
     log_verbose "Updated last found site: $site_name (ID: $site_id)"
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~
 # Profile management
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
+# ~~~~~~~~~~~~~~~~~~
 
 list_profiles() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -799,9 +798,9 @@ load_profile() {
     fi
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~
 # Cluster functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~
 
 get_cluster_url() {
     local name="$1"
@@ -826,9 +825,9 @@ list_clusters() {
     fi
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Interactive config functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 select_cluster() {
     local existing="${1:-}"
@@ -1245,9 +1244,9 @@ cmd_config() {
     interactive_config "$target_profile" "$explicit_profile"
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~
 # MAC address functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~
 
 validate_mac() {
     local mac="$1"
@@ -1340,9 +1339,9 @@ get_local_wifi_mac() {
     return 1
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~
 # OAuth2 functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~
 
 generate_access_token() {
     local url="https://sso.common.cloud.hpe.com/as/token.oauth2"
@@ -1400,9 +1399,9 @@ is_token_expired() {
     [[ $age -gt 720 ]]
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Smart site search functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Try to find MAC in the last known site (fast-path)
 # Returns 0 if found, 1 if not found
@@ -1490,7 +1489,6 @@ auto_search_all_sites() {
     local mac="$1"
     local start_time
     start_time=$(date +%s)
-    local search_started=false
     local show_progress=false
 
     # Count sites to search
@@ -1667,9 +1665,9 @@ auto_search_all_sites() {
     return 1
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~
 # API functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~
 
 api_get() {
     local endpoint="$1"
@@ -1844,9 +1842,9 @@ get_ap_by_serial() {
     api_get "$endpoint"
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~
 # SSH functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~
 
 get_ssh_password() {
     # Check config
@@ -2012,9 +2010,9 @@ EXPECT_EOF
     return $exit_code
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~
 # Main workflow
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~
 
 cmd_lookup() {
     local input="$1"
@@ -2065,7 +2063,7 @@ cmd_lookup() {
     if [[ -n "$SITE_ID_FILTER" ]]; then
         # User provided --site-id
         site_id="$SITE_ID_FILTER"
-        site_name=$(find_site_by_id "$site_id")
+        site_name=$(find_site_by_id "$site_id") || true
 
         if [[ -z "$site_name" ]]; then
             log_error "Site ID '$site_id' not found in cache"
@@ -2077,7 +2075,7 @@ cmd_lookup() {
 
     elif [[ -n "$SITE_FILTER" ]]; then
         # User provided --site <name>
-        site_id=$(find_site_by_name "$SITE_FILTER")
+        site_id=$(find_site_by_name "$SITE_FILTER") || true
 
         if [[ -z "$site_id" ]]; then
             log_error "Site '$SITE_FILTER' not found in cache"
@@ -2476,9 +2474,9 @@ cmd_shell() {
     fi
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~
 # Site management commands
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~
 
 cmd_list_sites() {
     ensure_config_dir
@@ -2569,13 +2567,13 @@ cmd_list_aps() {
     local site_id site_name
     if [[ -n "$SITE_ID_FILTER" ]]; then
         site_id="$SITE_ID_FILTER"
-        site_name=$(find_site_by_id "$site_id")
+        site_name=$(find_site_by_id "$site_id") || true
         if [[ -z "$site_name" ]]; then
             log_error "Site ID '$site_id' not found"
             exit "$EXIT_ERROR"
         fi
     else
-        site_id=$(find_site_by_name "$SITE_FILTER")
+        site_id=$(find_site_by_name "$SITE_FILTER") || true
         if [[ -z "$site_id" ]]; then
             log_error "Site '$SITE_FILTER' not found"
             exit "$EXIT_ERROR"
@@ -2636,13 +2634,13 @@ cmd_refresh_aps() {
     local site_id site_name
     if [[ -n "$SITE_ID_FILTER" ]]; then
         site_id="$SITE_ID_FILTER"
-        site_name=$(find_site_by_id "$site_id")
+        site_name=$(find_site_by_id "$site_id") || true
         if [[ -z "$site_name" ]]; then
             log_error "Site ID '$site_id' not found"
             exit "$EXIT_ERROR"
         fi
     else
-        site_id=$(find_site_by_name "$SITE_FILTER")
+        site_id=$(find_site_by_name "$SITE_FILTER") || true
         if [[ -z "$site_id" ]]; then
             log_error "Site '$SITE_FILTER' not found"
             exit "$EXIT_ERROR"
@@ -2663,16 +2661,15 @@ cmd_refresh_aps() {
     cmd_list_aps
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Help functions
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~
+# Helper functions
+# ~~~~~~~~~~~~~~~~
 
 show_help() {
     cat << EOF
 $SCRIPT_NAME v$VERSION - Aruba New Central "Jump-to-AP" SSH tool
 
-Quickly "hop" into the access point serving a wireless client by providing
-only the client's MAC address or known AP BSSID.
+Quickly "hop" into an AP by providing a client MAC or AP BSSID
 
 USAGE:
     $SCRIPT_NAME [<mac|bssid>] [OPTIONS]
@@ -2689,6 +2686,7 @@ ARGUMENTS:
 GLOBAL OPTIONS:
     -h, --help              Show this help message
     --version               Show version
+    --completion <shell>    Generate shell completion script (bash or zsh)
 
 SITE & AP CACHE COMMANDS (standalone):
     --list-sites            Show cached sites and exit
@@ -2696,7 +2694,7 @@ SITE & AP CACHE COMMANDS (standalone):
     --list-aps              Show cached APs (requires --site or --site-id)
     --refresh-aps           Force refresh AP cache (requires --site or --site-id)
 
-MAC LOOKUP OPTIONS (used after MAC address):
+MAC LOOKUP OPTIONS (used after MAC address is entered):
     -p, --profile <name>    Use specified profile instead of default
     --site <name>           Search in specific site by name
     --site-id <id>          Search in specific site by ID
@@ -2726,48 +2724,53 @@ CONFIG SUBCOMMAND:
     $SCRIPT_NAME config --use <name>                  Set default profile
     $SCRIPT_NAME config --delete --profile <name>     Delete a profile
 
+UPDATE SUBCOMMAND:
+    $SCRIPT_NAME update                               Update to latest version
+    $SCRIPT_NAME update --check                       Check if update available
+    $SCRIPT_NAME update --force                       Force reinstall
+
 EXAMPLES:
     # Basic lookup
-    $SCRIPT_NAME                                      # Auto-detect local Wi-Fi
-    $SCRIPT_NAME de:ad:be:ef:de:ad                    # Interactive site selection
+    $SCRIPT_NAME                                      Auto-detect local Wi-Fi
+    $SCRIPT_NAME de:ad:be:ef:de:ad                    Interactive site selection
 
     # BSSID lookup
-    $SCRIPT_NAME 68:51:34:7c:32:10                   # BSSID lookup
-    $SCRIPT_NAME 68:51:34:7c:32:10 --verify          # With API verification
+    $SCRIPT_NAME de:ad:be:ef:de:ad                    BSSID lookup
+    $SCRIPT_NAME de:ad:be:ef:de:ad --verify           With API verification
 
     # Site selection
-    $SCRIPT_NAME de:ad:be:ef:de:ad --site "Twede's Cafe"
+    $SCRIPT_NAME de:ad:be:ef:de:ad --site "The Grid"
     $SCRIPT_NAME de:ad:be:ef:de:ad --site-id 51101706940
-    $SCRIPT_NAME de:ad:be:ef:de:ad --all             # Show all sites including empty ones
+    $SCRIPT_NAME de:ad:be:ef:de:ad --all             Show all sites including empty ones
 
     # Profile and options
     $SCRIPT_NAME de:ad:be:ef:de:ad --profile prod
-    $SCRIPT_NAME de:ad:be:ef:de:ad --verbose         # Show API responses
-    $SCRIPT_NAME de:ad:be:ef:de:ad --dry-run         # Test without SSH
+    $SCRIPT_NAME de:ad:be:ef:de:ad --verbose         Show API responses
+    $SCRIPT_NAME de:ad:be:ef:de:ad --dry-run         Test without SSH
 
     # Combining options (flags after MAC address)
     $SCRIPT_NAME de:ad:be:ef:de:ad --site "The Grid" --profile prod --verbose
 
     # Site and AP cache management
-    $SCRIPT_NAME --list-sites                        # Show available sites
-    $SCRIPT_NAME --list-sites --all                  # Include sites with 0 clients
-    $SCRIPT_NAME --refresh-sites                     # Update site cache
-    $SCRIPT_NAME --list-aps --site "Twede's Cafe"    # Show APs in site
-    $SCRIPT_NAME --refresh-aps --site "Twede's Cafe" 
+    $SCRIPT_NAME --list-sites                        Show available sites
+    $SCRIPT_NAME --list-sites --all                  Include sites with 0 clients
+    $SCRIPT_NAME --refresh-sites                     Update site cache
+    $SCRIPT_NAME --list-aps --site "The Grid"        Show APs in site
+    $SCRIPT_NAME --refresh-aps --site "The Grid"
 
     # Config management
-    $SCRIPT_NAME config                              # Interactive setup
-    $SCRIPT_NAME config --use prod                   # Set default profile
+    $SCRIPT_NAME config                              Interactive setup
+    $SCRIPT_NAME config --use prod                   Set default profile
 
 ENVIRONMENT VARIABLES:
     ARUBA_SSH_PASSWORD      SSH password (if not in config)
     XDG_CONFIG_HOME         Config directory base (default: ~/.config)
 
 FILES:
-    \$XDG_CONFIG_HOME/$SCRIPT_NAME/config          Profile configuration
-    \$XDG_CONFIG_HOME/$SCRIPT_NAME/clusters        Cluster URL definitions
-    \$XDG_CONFIG_HOME/$SCRIPT_NAME/sites_cache     Site cache (24hr TTL)
-    \$XDG_CONFIG_HOME/$SCRIPT_NAME/aps_cache_*     AP cache per site (24hr TTL)
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/config            Profile configuration
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/clusters          Cluster URL definitions
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/sites_cache       Site cache (24hr TTL)
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/aps_cache_*       AP cache per site (24hr TTL)
 
 EOF
 }
@@ -2789,21 +2792,465 @@ OPTIONS:
     -h, --help              Show this help message
 
 EXAMPLES:
-    $SCRIPT_NAME config                              # Interactive setup
-    $SCRIPT_NAME config --profile production         # Configure 'production' profile
-    $SCRIPT_NAME config --show                       # Show active profile (masked)
-    $SCRIPT_NAME config --show --unmask              # Show active profile (unmasked)
-    $SCRIPT_NAME config --show --profile prod        # Show 'prod' profile
-    $SCRIPT_NAME config --list                       # List all profiles
-    $SCRIPT_NAME config --use production             # Set 'production' as default
-    $SCRIPT_NAME config --delete --profile old       # Delete 'old' profile
+    $SCRIPT_NAME config                              Interactive setup
+    $SCRIPT_NAME config --profile production         Configure 'production' profile
+    $SCRIPT_NAME config --show                       Show active profile (masked)
+    $SCRIPT_NAME config --show --unmask              Show active profile (unmasked)
+    $SCRIPT_NAME config --show --profile prod        Show 'prod' profile
+    $SCRIPT_NAME config --list                       List all profiles
+    $SCRIPT_NAME config --use production             Set 'production' as default
+    $SCRIPT_NAME config --delete --profile old       Delete 'old' profile
 
 EOF
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Shell completion generation
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+generate_completion() {
+    local shell="$1"
+
+    case "$shell" in
+        bash)
+            _generate_bash_completion
+            ;;
+        zsh)
+            _generate_zsh_completion
+            ;;
+        *)
+            log_error "Unknown shell: $shell. Supported: bash, zsh"
+            exit "$EXIT_ERROR"
+            ;;
+    esac
+}
+
+_generate_bash_completion() {
+    cat << 'COMPLETION_EOF'
+# bash completion for ap-hop
+# Generated dynamically - do not edit manually
+
+_ap-hop() {
+    local cur prev words cword
+    _init_completion || return
+
+    # Get config directory for reading sites and profiles
+    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ap-hop"
+    local sites_cache="$config_dir/sites_cache"
+    local config_file="$config_dir/config"
+
+    # Complete options after ap-hop
+    if [[ $cword -eq 1 ]]; then
+        local opts="-h --help --version --list-sites --refresh-sites --list-aps --refresh-aps --completion config shell update"
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+        return
+    fi
+
+    # Handle subcommands
+    case "${words[1]}" in
+        config)
+            local config_opts="--profile -p --show --unmask --list --use --delete -h --help"
+            COMPREPLY=( $(compgen -W "$config_opts" -- "$cur") )
+            return
+            ;;
+        update)
+            local update_opts="--check --force -h --help"
+            COMPREPLY=( $(compgen -W "$update_opts" -- "$cur") )
+            return
+            ;;
+        shell)
+            # MAC address completion not practical, just return
+            return
+            ;;
+    esac
+
+    # Check if previous option needs a value
+    case "$prev" in
+        --profile|-p)
+            # Complete profile names from config file
+            if [[ -f "$config_file" ]]; then
+                local profiles=$(grep '^\[' "$config_file" | grep -v '^\[_' | sed 's/^\[\(.*\)\]$/\1/')
+                COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
+            fi
+            return
+            ;;
+        --site)
+            # Complete site names from cache
+            if [[ -f "$sites_cache" ]]; then
+                local sites=$(grep -v '^#' "$sites_cache" | cut -d'|' -f2)
+                COMPREPLY=( $(compgen -W "$sites" -- "$cur") )
+            fi
+            return
+            ;;
+        --site-id)
+            # Complete site IDs from cache
+            if [[ -f "$sites_cache" ]]; then
+                local site_ids=$(grep -v '^#' "$sites_cache" | cut -d'|' -f1)
+                COMPREPLY=( $(compgen -W "$site_ids" -- "$cur") )
+            fi
+            return
+            ;;
+        --use)
+            # Complete profile names for config --use
+            if [[ -f "$config_file" ]]; then
+                local profiles=$(grep '^\[' "$config_file" | grep -v '^\[_' | sed 's/^\[\(.*\)\]$/\1/')
+                COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
+            fi
+            return
+            ;;
+        --completion)
+            COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+            return
+            ;;
+    esac
+
+    # Complete global options
+    local global_opts="-p --profile --site --site-id --all --verify --non-interactive -v --verbose -n --dry-run -h --help"
+    COMPREPLY=( $(compgen -W "$global_opts" -- "$cur") )
+}
+
+complete -F _ap-hop ap-hop
+COMPLETION_EOF
+}
+
+_generate_zsh_completion() {
+    cat << 'COMPLETION_EOF'
+#compdef ap-hop
+# zsh completion for ap-hop
+# Generated dynamically - do not edit manually
+
+_ap-hop() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    # Get config directory
+    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ap-hop"
+    local sites_cache="$config_dir/sites_cache"
+    local config_file="$config_dir/config"
+
+    # Helper function to get profiles from config
+    _ap-hop_profiles() {
+        local -a profiles
+        if [[ -f "$config_file" ]]; then
+            profiles=(${(f)"$(grep '^\[' "$config_file" | grep -v '^\[_' | sed 's/^\[\(.*\)\]$/\1/')"})
+        fi
+        _describe -t profiles 'profiles' profiles
+    }
+
+    # Helper function to get sites from cache
+    _ap-hop_sites() {
+        local -a sites
+        if [[ -f "$sites_cache" ]]; then
+            sites=(${(f)"$(grep -v '^#' "$sites_cache" | cut -d'|' -f2)"})
+        fi
+        _describe -t sites 'sites' sites
+    }
+
+    # Helper function to get site IDs from cache
+    _ap-hop_site_ids() {
+        local -a site_ids
+        if [[ -f "$sites_cache" ]]; then
+            site_ids=(${(f)"$(grep -v '^#' "$sites_cache" | cut -d'|' -f1)"})
+        fi
+        _describe -t site-ids 'site IDs' site_ids
+    }
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[Show help message]' \
+        '(--version)'--version'[Show version]' \
+        '(--list-sites)'--list-sites'[Show cached sites]' \
+        '(--refresh-sites)'--refresh-sites'[Force refresh site cache]' \
+        '(--list-aps)'--list-aps'[Show cached APs]' \
+        '(--refresh-aps)'--refresh-aps'[Force refresh AP cache]' \
+        '(-p --profile)'{-p,--profile}'[Use specified profile]:profile:_ap-hop_profiles' \
+        '(--site)'--site'[Search in specific site by name]:site:_ap-hop_sites' \
+        '(--site-id)'--site-id'[Search in specific site by ID]:site ID:_ap-hop_site_ids' \
+        '(--all)'--all'[Show all sites in interactive selection]' \
+        '(--verify)'--verify'[Verify AP status via API before SSH]' \
+        '(--non-interactive)'--non-interactive'[Skip all prompts]' \
+        '(-v --verbose)'{-v,--verbose}'[Show raw JSON API responses]' \
+        '(-n --dry-run)'{-n,--dry-run}'[Query API without connecting via SSH]' \
+        '(--completion)'--completion'[Generate shell completion]:shell:(bash zsh)' \
+        '1: :->subcommand' \
+        '*:: :->args'
+
+    case "$state" in
+        subcommand)
+            local -a subcmds
+            subcmds=(
+                'config:Manage profile configuration'
+                'update:Update ap-hop to latest version'
+                'shell:SSH and auto-escalate to root'
+            )
+            _describe -t commands 'ap-hop subcommand' subcmds
+            ;;
+        args)
+            case "$line[1]" in
+                config)
+                    _arguments \
+                        '(-p --profile)'{-p,--profile}'[Specify profile]:profile:_ap-hop_profiles' \
+                        '(--show)'--show'[Show profile configuration]' \
+                        '(--unmask)'--unmask'[Show sensitive values with --show]' \
+                        '(--list)'--list'[List all profiles]' \
+                        '(--use)'--use'[Set default profile]:profile:_ap-hop_profiles' \
+                        '(--delete)'--delete'[Delete profile]' \
+                        '(-h --help)'{-h,--help}'[Show config help]'
+                    ;;
+                update)
+                    _arguments \
+                        '(--check)'--check'[Check if update is available]' \
+                        '(--force)'--force'[Force update even if on latest version]' \
+                        '(-h --help)'{-h,--help}'[Show update help]'
+                    ;;
+                shell)
+                    # No specific completions for shell subcommand
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_ap-hop "$@"
+COMPLETION_EOF
+}
+
+# ~~~~~~~~~~~~~~~~~
+# Update functions
+# ~~~~~~~~~~~~~~~~~
+
+readonly UPDATE_URL="https://raw.githubusercontent.com/joshschmelzle/ap-hop/main/ap-hop"
+readonly UPDATE_CHECK_INTERVAL=86400
+
+get_latest_version() {
+    local version
+    version=$(curl -fsSL --max-time 5 "$UPDATE_URL" 2>/dev/null | grep -m1 '^readonly VERSION=' | cut -d'"' -f2)
+    echo "$version"
+}
+
+version_ge() {
+    # Returns 0 if $1 >= $2
+    printf '%s\n%s\n' "$2" "$1" | sort -V -C
+}
+
+check_for_update() {
+    local latest_version
+    latest_version=$(get_latest_version)
+
+    if [[ -z "$latest_version" ]]; then
+        return 1
+    fi
+
+    if ! version_ge "$VERSION" "$latest_version"; then
+        echo "$latest_version"
+        return 0
+    fi
+
+    return 1
+}
+
+background_update_check() {
+    local config_dir
+    config_dir=$(get_config_dir)
+    local current_time
+    current_time=$(date +%s)
+
+    # Get last check time from config
+    local last_check
+    last_check=$(read_ini_value "$config_dir/config" "_settings" "last_update_check" 2>/dev/null || echo "0")
+
+    # Check if 24 hours have passed
+    if [[ $((current_time - last_check)) -lt $UPDATE_CHECK_INTERVAL ]]; then
+        return 0
+    fi
+
+    # Update last check time
+    write_ini_value "$config_dir/config" "_settings" "last_update_check" "$current_time"
+
+    # Check for update (silently)
+    local latest_version
+    latest_version=$(check_for_update)
+
+    if [[ -n "$latest_version" ]]; then
+        write_ini_value "$config_dir/config" "_settings" "update_available" "true"
+        write_ini_value "$config_dir/config" "_settings" "latest_version" "$latest_version"
+    fi
+}
+
+show_update_notification() {
+    local config_dir
+    config_dir=$(get_config_dir)
+
+    local update_available
+    update_available=$(read_ini_value "$config_dir/config" "_settings" "update_available" 2>/dev/null || echo "false")
+
+    if [[ "$update_available" != "true" ]]; then
+        return 0
+    fi
+
+    local latest_version
+    latest_version=$(read_ini_value "$config_dir/config" "_settings" "latest_version" 2>/dev/null || echo "")
+
+    if [[ -z "$latest_version" ]]; then
+        return 0
+    fi
+
+    local last_shown
+    last_shown=$(read_ini_value "$config_dir/config" "_settings" "update_last_shown" 2>/dev/null || echo "0")
+    local current_time
+    current_time=$(date +%s)
+
+    # Only show once per day
+    if [[ $((current_time - last_shown)) -lt $UPDATE_CHECK_INTERVAL ]]; then
+        return 0
+    fi
+
+    # Show notification
+    echo ""
+    echo "Update available: $VERSION → $latest_version. Run 'ap-hop update' to install."
+    echo ""
+
+    # Update last shown time and clear flag
+    write_ini_value "$config_dir/config" "_settings" "update_last_shown" "$current_time"
+    write_ini_value "$config_dir/config" "_settings" "update_available" "false"
+}
+
+cmd_update() {
+    local check_only=false
+    local force=false
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check)
+                check_only=true
+                shift
+                ;;
+            --force)
+                force=true
+                shift
+                ;;
+            -h|--help)
+                cat << EOF
+$SCRIPT_NAME update - Update to the latest version
+
+USAGE:
+    $SCRIPT_NAME update [OPTIONS]
+
+OPTIONS:
+    --check                 Check if update is available without installing
+    --force                 Force update even if already on latest version
+    -h, --help              Show this help message
+
+EXAMPLES:
+    $SCRIPT_NAME update              Update to latest version
+    $SCRIPT_NAME update --check      Check if update available
+    $SCRIPT_NAME update --force      Reinstall current version
+
+EOF
+                exit "$EXIT_SUCCESS"
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                exit "$EXIT_ERROR"
+                ;;
+        esac
+    done
+
+    log_info "Checking for updates..."
+
+    local latest_version
+    latest_version=$(get_latest_version)
+
+    if [[ -z "$latest_version" ]]; then
+        log_error "Failed to check for updates. Please check your internet connection."
+        exit "$EXIT_ERROR"
+    fi
+
+    if [[ "$check_only" == true ]]; then
+        if version_ge "$VERSION" "$latest_version"; then
+            if [[ "$VERSION" == "$latest_version" ]]; then
+                log_info "You are on the latest version: $VERSION"
+            else
+                log_info "No update needed (you have $VERSION, latest is $latest_version)"
+            fi
+            exit "$EXIT_SUCCESS"
+        else
+            log_info "Update available: $VERSION → $latest_version"
+            exit "$EXIT_SUCCESS"
+        fi
+    fi
+
+    if [[ "$force" != true ]] && version_ge "$VERSION" "$latest_version"; then
+        if [[ "$VERSION" == "$latest_version" ]]; then
+            log_info "You are on the latest version: $VERSION"
+        else
+            log_info "No update needed (you have $VERSION, latest is $latest_version)"
+        fi
+        exit "$EXIT_SUCCESS"
+    fi
+
+    if [[ "$force" == true ]]; then
+        log_info "Force updating to $latest_version..."
+    else
+        log_info "Updating from $VERSION to $latest_version..."
+    fi
+
+    # Download to temp file
+    local temp_file
+    temp_file=$(mktemp)
+
+    if ! curl -fsSL "$UPDATE_URL" -o "$temp_file" 2>/dev/null; then
+        log_error "Failed to download update."
+        rm -f "$temp_file"
+        exit "$EXIT_ERROR"
+    fi
+
+    # Verify downloaded script is valid bash
+    if ! bash -n "$temp_file" 2>/dev/null; then
+        log_error "Downloaded script has syntax errors. Update aborted."
+        rm -f "$temp_file"
+        exit "$EXIT_ERROR"
+    fi
+
+    # Get current script location
+    local script_path
+    script_path=$(command -v "$SCRIPT_NAME" 2>/dev/null)
+
+    if [[ -z "$script_path" ]]; then
+        # Fallback to common install location
+        script_path="$HOME/.local/bin/$SCRIPT_NAME"
+    fi
+
+    # Replace script
+    if ! mv "$temp_file" "$script_path"; then
+        log_error "Failed to install update. You may need to run with appropriate permissions."
+        rm -f "$temp_file"
+        exit "$EXIT_ERROR"
+    fi
+
+    chmod +x "$script_path"
+
+    # Regenerate completions
+    local bash_dir="$HOME/.local/share/bash-completion/completions"
+    local zsh_dir="$HOME/.zsh/completions"
+
+    mkdir -p "$bash_dir" "$zsh_dir"
+
+    "$script_path" --completion bash > "$bash_dir/$SCRIPT_NAME" 2>/dev/null || true
+    "$script_path" --completion zsh > "$zsh_dir/_$SCRIPT_NAME" 2>/dev/null || true
+
+    # Clear update flags
+    local config_dir
+    config_dir=$(get_config_dir)
+    write_ini_value "$config_dir/config" "_settings" "update_available" "false"
+    write_ini_value "$config_dir/config" "_settings" "latest_version" ""
+
+    log_info "Done!"
+}
+
+# ~~~~~~~~~~~~~~~~~~~~~
 # Option parsing helper
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~
 
 # Parse options from an array and set global variables
 # Returns the number of arguments consumed
@@ -2881,10 +3328,6 @@ parse_options() {
     return $consumed
 }
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Main
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 main() {
     # Parse global options (stop at first positional argument)
     local positional_args=()
@@ -2960,6 +3403,14 @@ main() {
                 echo "$SCRIPT_NAME v$VERSION"
                 exit "$EXIT_SUCCESS"
                 ;;
+            --completion)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--completion requires a shell name (bash or zsh)"
+                    exit "$EXIT_ERROR"
+                fi
+                generate_completion "$2"
+                exit "$EXIT_SUCCESS"
+                ;;
             --)
                 shift
                 positional_args+=("$@")
@@ -2977,13 +3428,17 @@ main() {
         esac
     done
 
-    # Check dependencies
     check_dependencies
 
-    # Ensure config directory and files exist
     ensure_config_dir
     ensure_clusters_file
     ensure_config_file
+
+    # Check for updates in background
+    (background_update_check &)
+
+    # Show update notification if available
+    show_update_notification
 
     # Handle --list-sites and --refresh-sites commands
     if [[ "$LIST_SITES" == true ]]; then
@@ -3034,6 +3489,13 @@ main() {
             cmd_config "${positional_args[@]:1}"
         else
             cmd_config
+        fi
+    elif [[ "$first_arg" == "update" ]]; then
+        # Update subcommand
+        if [[ ${#positional_args[@]} -gt 1 ]]; then
+            cmd_update "${positional_args[@]:1}"
+        else
+            cmd_update
         fi
     elif [[ "$first_arg" == "shell" ]]; then
         # Shell subcommand

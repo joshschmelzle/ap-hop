@@ -181,6 +181,90 @@ EOF
     return 0
 }
 
+install_completions() {
+    local shell_name="${SHELL##*/}"
+    local bash_dir="$HOME/.local/share/bash-completion/completions"
+    local zsh_dir="$HOME/.zsh/completions"
+    local installed_any=false
+
+    info "Installing shell completions..."
+
+    # Create directories
+    mkdir -p "$bash_dir" "$zsh_dir"
+
+    # Generate and install bash completion
+    if "$INSTALL_DIR/$SCRIPT_NAME" --completion bash > "$bash_dir/$SCRIPT_NAME" 2>/dev/null; then
+        success "Installed bash completion to $bash_dir/$SCRIPT_NAME"
+        installed_any=true
+
+        # Add to .bashrc for persistence
+        local bash_rc="$HOME/.bashrc"
+        if [[ -f "$HOME/.bash_profile" ]]; then
+            bash_rc="$HOME/.bash_profile"
+        fi
+
+        if ! grep -q "$bash_dir/$SCRIPT_NAME" "$bash_rc" 2>/dev/null; then
+            cat >> "$bash_rc" << EOF
+
+# Load ap-hop completions if available
+[[ -f "$bash_dir/$SCRIPT_NAME" ]] && source "$bash_dir/$SCRIPT_NAME"
+EOF
+            success "Added bash completion source to $bash_rc"
+        fi
+
+        # Source immediately for current shell
+        if [[ "$shell_name" == "bash" ]]; then
+            # shellcheck source=/dev/null
+            source "$bash_dir/$SCRIPT_NAME" 2>/dev/null || true
+            success "Bash completions active in current shell"
+        fi
+    else
+        warn "Failed to generate bash completion"
+    fi
+
+    # Generate and install zsh completion
+    if "$INSTALL_DIR/$SCRIPT_NAME" --completion zsh > "$zsh_dir/_$SCRIPT_NAME" 2>/dev/null; then
+        success "Installed zsh completion to $zsh_dir/_$SCRIPT_NAME"
+        installed_any=true
+
+        # Add to .zshrc for persistence
+        local zsh_rc="$HOME/.zshrc"
+        if [[ -f "$zsh_rc" ]]; then
+            if ! grep -q "$zsh_dir" "$zsh_rc" 2>/dev/null; then
+                cat >> "$zsh_rc" << EOF
+
+# Add ap-hop completions to fpath
+fpath+=("$zsh_dir")
+EOF
+                success "Added zsh completion path to $zsh_rc"
+            fi
+
+            if ! grep -q "autoload -U compinit" "$zsh_rc" 2>/dev/null; then
+                cat >> "$zsh_rc" << 'EOF'
+
+# Initialize zsh completion system
+autoload -U compinit && compinit
+EOF
+                success "Added compinit to $zsh_rc"
+            fi
+        fi
+
+        if [[ "$shell_name" == "zsh" ]]; then
+            echo ""
+            info "Zsh completions installed. Restart your shell to activate them."
+        fi
+    else
+        warn "Failed to generate zsh completion"
+    fi
+
+    if [[ "$installed_any" == true ]]; then
+        echo ""
+        success "Shell completions installed successfully"
+    else
+        warn "No completions were installed"
+    fi
+}
+
 main() {
     echo ""
     echo "╔═══════════════════════════════════════╗"
@@ -192,6 +276,7 @@ main() {
     echo ""
     install_script
     clear_caches
+    install_completions
     local path_modified
     path_modified=$(setup_path)
     echo ""
