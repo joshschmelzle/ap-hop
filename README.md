@@ -30,6 +30,12 @@ To reconfigure later:
 ap-hop config
 ```
 
+Update to the latest version:
+
+```bash
+ap-hop update
+```
+
 ## Use
 
 Your own Wi-Fi MAC:

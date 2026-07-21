@@ -11,7 +11,7 @@ set -euo pipefail
 # Constants
 # ~~~~~~~~~
 
-readonly VERSION="0.0.7"
+readonly VERSION="0.0.8"
 readonly SCRIPT_NAME="ap-hop"
 readonly DEFAULT_SSH_USER="admin"
 readonly DEFAULT_SSH_TIMEOUT=10
@@ -3512,6 +3512,7 @@ COMPLETION_EOF
 # ~~~~~~~~~~~~~~~~~
 
 readonly UPDATE_URL="https://raw.githubusercontent.com/joshschmelzle/ap-hop/main/ap-hop"
+readonly INSTALLER_URL="https://wifi.lol/ap-hop"
 readonly UPDATE_CHECK_INTERVAL=86400
 
 get_latest_version() {
@@ -3688,49 +3689,28 @@ EOF
         log_info "Updating from $VERSION to $latest_version..."
     fi
 
-    # Download to temp file
-    local temp_file
-    temp_file=$(mktemp)
+    local installer_file
+    installer_file=$(mktemp)
 
-    if ! curl -fsSL "$UPDATE_URL" -o "$temp_file" 2>/dev/null; then
-        log_error "Failed to download update."
-        rm -f "$temp_file"
+    if ! curl -fsSL "$INSTALLER_URL" -o "$installer_file"; then
+        log_error "Failed to download installer from $INSTALLER_URL"
+        rm -f "$installer_file"
         exit "$EXIT_ERROR"
     fi
 
-    # Verify downloaded script is valid bash
-    if ! bash -n "$temp_file" 2>/dev/null; then
-        log_error "Downloaded script has syntax errors. Update aborted."
-        rm -f "$temp_file"
+    if ! bash -n "$installer_file"; then
+        log_error "Downloaded installer has syntax errors. Update aborted."
+        rm -f "$installer_file"
         exit "$EXIT_ERROR"
     fi
 
-    # Get current script location
-    local script_path
-    script_path=$(command -v "$SCRIPT_NAME" 2>/dev/null)
-
-    if [[ -z "$script_path" ]]; then
-        # Fallback to common install location
-        script_path="$HOME/.local/bin/$SCRIPT_NAME"
-    fi
-
-    # Replace script
-    if ! mv "$temp_file" "$script_path"; then
-        log_error "Failed to install update. You may need to run with appropriate permissions."
-        rm -f "$temp_file"
+    if ! bash "$installer_file"; then
+        log_error "Installer failed. Update aborted."
+        rm -f "$installer_file"
         exit "$EXIT_ERROR"
     fi
 
-    chmod +x "$script_path"
-
-    # Regenerate completions
-    local bash_dir="$HOME/.local/share/bash-completion/completions"
-    local zsh_dir="$HOME/.zsh/completions"
-
-    mkdir -p "$bash_dir" "$zsh_dir"
-
-    "$script_path" --completion bash > "$bash_dir/$SCRIPT_NAME" 2>/dev/null || true
-    "$script_path" --completion zsh > "$zsh_dir/_$SCRIPT_NAME" 2>/dev/null || true
+    rm -f "$installer_file"
 
     # Clear update flags
     local config_dir
@@ -3738,7 +3718,7 @@ EOF
     write_ini_value "$config_dir/config" "_settings" "update_available" "false"
     write_ini_value "$config_dir/config" "_settings" "latest_version" ""
 
-    log_info "Done!"
+    log_info "Updated to $latest_version."
 }
 
 # ~~~~~~~~~~~~~~~~~~~~~
