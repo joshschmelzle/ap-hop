@@ -11,10 +11,12 @@ set -euo pipefail
 # Constants
 # ~~~~~~~~~
 
-readonly VERSION="0.0.6"
+readonly VERSION="0.0.7"
 readonly SCRIPT_NAME="ap-hop"
 readonly DEFAULT_SSH_USER="admin"
 readonly DEFAULT_SSH_TIMEOUT=10
+readonly DEFAULT_API_CONNECT_TIMEOUT=5
+readonly DEFAULT_API_TIMEOUT=15
 
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
@@ -68,6 +70,13 @@ REFRESH_SITES=false
 LIST_APS=false
 REFRESH_APS=false
 SHOW_ALL_SITES=false
+LAST_API_ERROR_KIND=""
+LAST_API_CURL_EXIT_CODE=""
+LAST_API_CURL_ERROR=""
+LAST_API_FAILURE_STAGE=""
+LAST_BSSID_LOOKUP_STATUS=""
+SEARCH_INCOMPLETE=false
+SEARCH_FAILED_SITES=()
 
 # ~~~~~~~~~~~~~~~~~
 # Utility functions
@@ -81,6 +90,10 @@ log_info() {
     echo "$*"
 }
 
+log_status() {
+    echo "$*" >&2
+}
+
 log_error() {
     echo "Error: $*" >&2
 }
@@ -89,6 +102,199 @@ log_error() {
 log_verbose() {
     if [[ "$VERBOSE" == true ]]; then
         echo "$*" >&2
+    fi
+}
+
+reset_api_error() {
+    LAST_API_ERROR_KIND=""
+    LAST_API_CURL_EXIT_CODE=""
+    LAST_API_CURL_ERROR=""
+    LAST_API_FAILURE_STAGE=""
+}
+
+api_error_is_hard() {
+    [[ -n "$LAST_API_ERROR_KIND" && "$LAST_API_ERROR_KIND" != "not_found" ]]
+}
+
+api_error_is_systemic() {
+    case "$LAST_API_ERROR_KIND" in
+        auth|permission|rate_limit|connect|http_error)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+reset_search_state() {
+    SEARCH_INCOMPLETE=false
+    SEARCH_FAILED_SITES=()
+}
+
+record_failed_site() {
+    local site_name="$1"
+
+    local existing
+    for existing in "${SEARCH_FAILED_SITES[@]:-}"; do
+        if [[ "$existing" == "$site_name" ]]; then
+            SEARCH_INCOMPLETE=true
+            return
+        fi
+    done
+
+    SEARCH_INCOMPLETE=true
+    SEARCH_FAILED_SITES+=("$site_name")
+}
+
+format_failed_sites() {
+    local failed_count="${#SEARCH_FAILED_SITES[@]}"
+
+    if [[ $failed_count -eq 0 ]]; then
+        return 0
+    fi
+
+    if [[ $failed_count -le 3 ]]; then
+        printf '%s' "${SEARCH_FAILED_SITES[*]}"
+        return 0
+    fi
+
+    printf '%s, %s, %s (+%d more)' \
+        "${SEARCH_FAILED_SITES[0]}" \
+        "${SEARCH_FAILED_SITES[1]}" \
+        "${SEARCH_FAILED_SITES[2]}" \
+        "$((failed_count - 3))"
+}
+
+report_incomplete_search() {
+    local target="$1"
+
+    log_error "MAC address $target was not found in the sites that were searched."
+    log_error "Search incomplete: could not fully search ${#SEARCH_FAILED_SITES[@]} site(s): $(format_failed_sites)"
+    log_error "Central connectivity issues prevented a complete search."
+}
+
+report_incomplete_site_lookup() {
+    local target="$1"
+    local site_name="$2"
+
+    log_error "Search incomplete in site '$site_name'."
+    log_error "Could not confirm whether $target is present because Central connectivity failed."
+}
+
+get_url_host() {
+    local url="$1"
+    local host="${url#*://}"
+    host="${host%%/*}"
+    printf '%s\n' "$host"
+}
+
+classify_curl_failure_stage() {
+    local curl_exit_code="$1"
+    local curl_error="$2"
+    local time_namelookup="${3:-0}"
+    local time_connect="${4:-0}"
+    local time_appconnect="${5:-0}"
+
+    case "$curl_exit_code" in
+        6)
+            printf '%s\n' "DNS lookup"
+            return 0
+            ;;
+        7)
+            printf '%s\n' "TCP connect"
+            return 0
+            ;;
+        35|51|58|60)
+            printf '%s\n' "TLS handshake"
+            return 0
+            ;;
+    esac
+
+    if [[ "$curl_error" == *"Resolving timed out"* ]] || [[ "$curl_error" == *"Could not resolve host"* ]]; then
+        printf '%s\n' "DNS lookup"
+    elif [[ "$curl_error" == *"Failed to connect"* ]] || [[ "$curl_error" == *"Connection refused"* ]] || [[ "$curl_error" == *"No route to host"* ]]; then
+        printf '%s\n' "TCP connect"
+    elif [[ "$curl_error" == *"SSL"* ]] || [[ "$curl_error" == *"TLS"* ]] || [[ "$curl_error" == *"certificate"* ]]; then
+        printf '%s\n' "TLS handshake"
+    elif [[ "$curl_exit_code" == "28" && "$time_namelookup" == "0.000000" && "$time_connect" == "0.000000" ]]; then
+        printf '%s\n' "DNS lookup"
+    elif [[ "$curl_exit_code" == "28" && "$time_connect" == "0.000000" ]]; then
+        printf '%s\n' "TCP connect"
+    elif [[ "$curl_exit_code" == "28" && "$time_appconnect" == "0.000000" ]]; then
+        printf '%s\n' "TLS handshake"
+    elif [[ "$curl_exit_code" == "28" ]]; then
+        printf '%s\n' "response wait"
+    else
+        printf '%s\n' "transport"
+    fi
+}
+
+report_curl_transport_failure() {
+    local url="$1"
+    local endpoint="$2"
+    local connect_timeout="$3"
+    local request_timeout="$4"
+
+    log_error "Central request failed before any HTTP response was received."
+    log_error "  curl exit code: ${LAST_API_CURL_EXIT_CODE:-unknown}"
+    if [[ -n "$LAST_API_CURL_ERROR" ]]; then
+        log_error "  curl error: $LAST_API_CURL_ERROR"
+    fi
+    log_error "  Failure stage: ${LAST_API_FAILURE_STAGE:-transport}"
+    log_error "  Host: $(get_url_host "$url")"
+    log_error "  Profile: $CURRENT_PROFILE"
+    log_error "  Cluster URL: $CLUSTER_URL"
+    log_error "  Endpoint: $endpoint"
+    log_error "  Full URL: $url"
+    log_error "  Connect timeout: ${connect_timeout}s"
+    log_error "  Total timeout: ${request_timeout}s"
+}
+
+get_api_error_message() {
+    local response="$1"
+    local message=""
+
+    message=$(printf '%s' "$response" | jq -r '
+        if type == "object" then
+            [.error_description?, .message?,
+             (if (.error? | type) == "string" then .error else empty end),
+             .title?, .detail?]
+            | map(select(type == "string" and length > 0))
+            | .[0] // empty
+        else
+            empty
+        end
+    ' 2>/dev/null) || true
+
+    if [[ -z "$message" && -n "$response" ]]; then
+        message=$(printf '%s' "$response" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+    fi
+
+    if [[ ${#message} -gt 500 ]]; then
+        message="${message:0:500}..."
+    fi
+
+    printf '%s\n' "$message"
+}
+
+report_http_api_error() {
+    local http_code="$1"
+    local endpoint="$2"
+    local response="$3"
+    local reason
+    reason=$(get_api_error_message "$response")
+
+    log_error "Central API request failed (HTTP $http_code)."
+    if [[ -n "$reason" ]]; then
+        log_error "  Reason: $reason"
+    fi
+    log_error "  Profile: $CURRENT_PROFILE"
+    log_error "  Cluster URL: $CLUSTER_URL"
+    log_error "  Endpoint: $endpoint"
+
+    if [[ "$http_code" == "403" ]]; then
+        log_error "  Permission denied: this API client may be missing the required Aruba Central role or scope for this endpoint."
     fi
 }
 
@@ -136,8 +342,27 @@ ensure_config_dir() {
 
     if [[ ! -d "$CONFIG_DIR" ]]; then
         mkdir -p "$CONFIG_DIR"
-        chmod 700 "$CONFIG_DIR"
     fi
+
+    chmod 700 "$CONFIG_DIR"
+
+    # Old cache names are no longer read and may have been created world-readable.
+    rm -f "$CONFIG_DIR/sites_cache"
+    local cache_file cache_mode
+    for cache_file in "$CONFIG_DIR"/aps_cache_*; do
+        [[ -f "$cache_file" ]] || continue
+        [[ "${cache_file##*/}" == aps_cache_tmp.* ]] && continue
+
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            cache_mode=$(stat -f %OLp "$cache_file" 2>/dev/null || true)
+        else
+            cache_mode=$(stat -c %a "$cache_file" 2>/dev/null || true)
+        fi
+
+        if [[ "$cache_mode" =~ ^[0-7]+$ ]] && (( (8#$cache_mode & 077) != 0 )); then
+            rm -f "$cache_file"
+        fi
+    done
 }
 
 # Ensure clusters file exists with defaults
@@ -155,8 +380,9 @@ ensure_config_file() {
 default_profile=default
 ssh_timeout=10
 EOF
-        chmod 600 "$CONFIG_FILE"
     fi
+
+    chmod 600 "$CONFIG_FILE"
 }
 
 # ~~~~~~~~~~~~~~~~~~~~
@@ -164,7 +390,10 @@ EOF
 # ~~~~~~~~~~~~~~~~~~~~
 
 get_sites_cache_file() {
-    echo "$CONFIG_DIR/sites_cache"
+    local profile_key cluster_key
+    profile_key=$(sanitize_site_name "${CURRENT_PROFILE:-default}")
+    cluster_key=$(sanitize_site_name "${CLUSTER:-unknown}")
+    echo "$CONFIG_DIR/sites_cache_${profile_key}_${cluster_key}"
 }
 
 is_sites_cache_valid() {
@@ -188,24 +417,32 @@ is_sites_cache_valid() {
 }
 
 fetch_and_cache_sites() {
-    local endpoint="/network-monitoring/v1alpha1/sites-health"
+    local endpoint="/network-monitoring/v1/sites-health"
 
     log_verbose "Fetching sites from API..."
 
     local response
-    response=$(api_get "$endpoint") || {
+    api_get_into response "$endpoint" || {
         log_error "Failed to fetch sites"
         return 1
     }
 
     local cache_file
     cache_file=$(get_sites_cache_file)
+    local temp_file
+    temp_file=$(mktemp "$CONFIG_DIR/sites_cache_tmp.XXXXXX")
 
-    {
+    if ! {
         echo "# Sites cache - $(date)"
         echo "# Format: SITE_ID|SITE_NAME|CLIENT_COUNT|DEVICE_COUNT"
         echo "$response" | jq -r '.items[] | "\(.id)|\(.name)|\(.clients.count)|\(.devices.count)"'
-    } > "$cache_file"
+    } > "$temp_file"; then
+        rm -f "$temp_file"
+        log_error "Failed to write sites cache"
+        return 1
+    fi
+
+    mv "$temp_file" "$cache_file"
 
     local count
     count=$(grep -c -v '^#' "$cache_file")
@@ -272,7 +509,7 @@ find_site_by_id() {
     return 1
 }
 
-# Sets: SELECTED_SITE_ID, SELECTED_SITE_NAME, SELECTED_SITE_CLIENT_COUNT
+# Sets: SELECTED_SITE_ID, SELECTED_SITE_NAME
 select_site() {
     local filtered_indices=()
     local hidden_count=0
@@ -294,7 +531,6 @@ select_site() {
         local idx="${filtered_indices[0]}"
         SELECTED_SITE_ID="${SITE_IDS[$idx]}"
         SELECTED_SITE_NAME="${SITE_NAMES[$idx]}"
-        SELECTED_SITE_CLIENT_COUNT="${SITE_CLIENT_COUNTS[$idx]}"
         log_info "Auto-selected site: $SELECTED_SITE_NAME (${SITE_CLIENT_COUNTS[$idx]} clients)" >&2
         return
     fi
@@ -341,7 +577,6 @@ select_site() {
     local orig_idx="${filtered_indices[$filtered_idx]}"
     SELECTED_SITE_ID="${SITE_IDS[$orig_idx]}"
     SELECTED_SITE_NAME="${SITE_NAMES[$orig_idx]}"
-    SELECTED_SITE_CLIENT_COUNT="${SITE_CLIENT_COUNTS[$orig_idx]}"
 }
 
 sanitize_site_name() {
@@ -356,9 +591,11 @@ sanitize_site_name() {
 get_aps_cache_file() {
     local site_id="$1"
     local site_name="$2"
-    local sanitized
+    local sanitized profile_key cluster_key
     sanitized=$(sanitize_site_name "$site_name")
-    echo "$CONFIG_DIR/aps_cache_${sanitized}"
+    profile_key=$(sanitize_site_name "${CURRENT_PROFILE:-default}")
+    cluster_key=$(sanitize_site_name "${CLUSTER:-unknown}")
+    echo "$CONFIG_DIR/aps_cache_${profile_key}_${cluster_key}_${site_id}_${sanitized}"
 }
 
 is_aps_cache_valid() {
@@ -395,6 +632,8 @@ fetch_and_cache_aps() {
     local cache_file
     cache_file=$(get_aps_cache_file "$site_id" "$site_name")
     local max_aps="${MAX_APS_PER_SITE:-1000}"
+    local temp_file
+    temp_file=$(mktemp "$CONFIG_DIR/aps_cache_tmp.XXXXXX")
 
     log_info "Building AP cache for '$site_name'..."
 
@@ -402,24 +641,29 @@ fetch_and_cache_aps() {
     local offset=0
     local limit=100
     local total_fetched=0
+    local cache_incomplete=false
+    local systemic_failure=false
 
     while true; do
-        local endpoint="/network-monitoring/v1alpha1/aps?site-id=${site_id}&limit=${limit}&offset=${offset}"
+        local endpoint="/network-monitoring/v1/aps?limit=${limit}&offset=${offset}"
         local response
-        response=$(api_get "$endpoint") || {
+        api_get_into response "$endpoint" || {
+            rm -f "$temp_file"
             log_error "Failed to fetch APs for site"
+            if api_error_is_systemic; then
+                return 2
+            fi
             return 1
         }
 
         local online_aps
-        online_aps=$(echo "$response" | jq -r '.items[] | select(.status == "ONLINE") | .serialNumber')
+        online_aps=$(echo "$response" | jq -r --arg site_id "$site_id" \
+            '.items[] | select((.siteId | tostring) == $site_id and .status == "ONLINE") | .serialNumber')
 
-        if [[ -z "$online_aps" ]]; then
-            break
+        if [[ -n "$online_aps" ]]; then
+            all_aps="${all_aps}${online_aps}"$'\n'
+            total_fetched=$((total_fetched + $(echo "$online_aps" | wc -l | xargs)))
         fi
-
-        all_aps="${all_aps}${online_aps}"$'\n'
-        total_fetched=$((total_fetched + $(echo "$online_aps" | wc -l | xargs)))
 
         local next
         next=$(echo "$response" | jq -r '.next // empty')
@@ -435,6 +679,7 @@ fetch_and_cache_aps() {
     ap_count=$(echo "$all_aps" | wc -l | xargs)
 
     if [[ $ap_count -eq 0 ]]; then
+        rm -f "$temp_file"
         log_error "No online APs found in site '$site_name'"
         return 1
     fi
@@ -445,7 +690,7 @@ fetch_and_cache_aps() {
     local start_time
     start_time=$(date +%s)
 
-    {
+    if ! {
         echo "# APs cache for site: $site_name - $(date)"
         echo "# Format: SERIAL|NAME|MAC|IP|BSSID1,BSSID2,BSSID3,...|RADIOMAC1,RADIOMAC2,..."
 
@@ -453,8 +698,13 @@ fetch_and_cache_aps() {
             [[ -z "$serial" ]] && continue
 
             local ap_response
-            ap_response=$(api_get "/network-monitoring/v1alpha1/aps/${serial}" 2>/dev/null) || {
+            api_get_into ap_response "/network-monitoring/v1/aps/${serial}" || {
+                if api_error_is_systemic; then
+                    systemic_failure=true
+                    break
+                fi
                 log_verbose "Warning: Failed to fetch details for AP $serial"
+                cache_incomplete=true
                 processed=$((processed + 1))
                 continue
             }
@@ -466,6 +716,7 @@ fetch_and_cache_aps() {
 
             [[ -z "$ip" ]] && {
                 log_verbose "Warning: AP $serial has no IP address, skipping"
+                cache_incomplete=true
                 processed=$((processed + 1))
                 continue
             }
@@ -483,25 +734,39 @@ fetch_and_cache_aps() {
             fi
 
         done <<< "$all_aps"
-    } > "$cache_file"
+    } > "$temp_file"; then
+        rm -f "$temp_file"
+        log_error "Failed to write AP cache for site '$site_name'"
+        return 1
+    fi
 
     local end_time
     end_time=$(date +%s)
     local duration=$((end_time - start_time))
 
+    if [[ "$systemic_failure" == true ]]; then
+        rm -f "$temp_file"
+        log_error "Failed to fetch AP details for site '$site_name'"
+        return 2
+    fi
+
     local cached_count
-    cached_count=$(grep -c -v '^#' "$cache_file")
+    cached_count=$(grep -c -v '^#' "$temp_file")
 
     if [[ $cached_count -eq 0 ]]; then
+        rm -f "$temp_file"
         log_error "Failed to cache any APs for site '$site_name'"
-        rm -f "$cache_file"
         return 1
     fi
 
-    if [[ $cached_count -lt $ap_count ]]; then
-        log_info "Warning: Only cached $cached_count/$ap_count APs (some failed to fetch)"
+    if [[ "$cache_incomplete" == true ]] || [[ $cached_count -lt $ap_count ]]; then
+        rm -f "$temp_file"
+        log_error "Failed to build a complete AP cache for site '$site_name'"
+        log_error "Cached $cached_count/$ap_count APs before the refresh was interrupted"
+        return 1
     fi
 
+    mv "$temp_file" "$cache_file"
     log_info "Cache built in ${duration}s ($cached_count APs cached)"
     return 0
 }
@@ -514,6 +779,8 @@ find_serial_by_bssid_cached() {
     cache_file=$(get_aps_cache_file "$site_id" "$site_name")
     local normalized_bssid
     normalized_bssid=$(normalize_mac "$bssid")
+
+    [[ ! -f "$cache_file" ]] && return 1
 
     while IFS='|' read -r serial name mac ip bssids radio_macs; do
         [[ "$serial" =~ ^# ]] && continue
@@ -651,6 +918,30 @@ delete_ini_section() {
     mv "$temp_file" "$file"
 }
 
+delete_ini_value() {
+    local file="$1"
+    local section="$2"
+    local key="$3"
+    local temp_file
+
+    if [[ ! -f "$file" ]]; then
+        return 0
+    fi
+
+    temp_file=$(mktemp)
+
+    awk -v section="$section" -v key="$key" '
+        /^\[/ {
+            current_section = substr($0, 2, length($0) - 2)
+        }
+        current_section == section && index($0, key "=") == 1 { next }
+        { print }
+    ' "$file" > "$temp_file"
+
+    chmod 600 "$temp_file"
+    mv "$temp_file" "$file"
+}
+
 # ~~~~~~~~~~~~~~~~~
 # Profile functions
 # ~~~~~~~~~~~~~~~~~
@@ -679,6 +970,14 @@ get_ssh_timeout() {
     local timeout
     timeout=$(read_ini_value "$CONFIG_FILE" "_settings" "ssh_timeout")
     echo "${timeout:-$DEFAULT_SSH_TIMEOUT}"
+}
+
+get_api_connect_timeout() {
+    echo "${ARUBA_API_CONNECT_TIMEOUT:-$DEFAULT_API_CONNECT_TIMEOUT}"
+}
+
+get_api_timeout() {
+    echo "${ARUBA_API_TIMEOUT:-$DEFAULT_API_TIMEOUT}"
 }
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -960,6 +1259,7 @@ interactive_config() {
     write_ini_value "$CONFIG_FILE" "$profile" "cluster" "$cluster"
     write_ini_value "$CONFIG_FILE" "$profile" "client_id" "$client_id"
     write_ini_value "$CONFIG_FILE" "$profile" "client_secret" "$client_secret"
+    clear_cached_token "$profile"
     write_ini_value "$CONFIG_FILE" "$profile" "ssh_user" "$ssh_user"
     write_ini_value "$CONFIG_FILE" "$profile" "ssh_password" "$ssh_password"
     write_ini_value "$CONFIG_FILE" "$profile" "max_aps_per_site" "$max_aps_per_site"
@@ -1345,21 +1645,62 @@ get_local_wifi_mac() {
 
 generate_access_token() {
     local url="https://sso.common.cloud.hpe.com/as/token.oauth2"
+    local connect_timeout
+    local request_timeout
+    connect_timeout=$(get_api_connect_timeout)
+    request_timeout=$(get_api_timeout)
+    local curl_stderr_file
+    curl_stderr_file=$(mktemp)
 
+    log_status "Refreshing access token from Central..."
     log_verbose "Generating access token..."
 
-    local response http_code
-    response=$(curl -s -w "\n%{http_code}" \
+    local response http_code curl_exit_code
+    if response=$(curl -sS -w "\n%{http_code}" \
         -X POST "$url" \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$request_timeout" \
         -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET")
+        -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET" \
+        2>"$curl_stderr_file"); then
+        curl_exit_code=0
+    else
+        curl_exit_code=$?
+    fi
 
     http_code=$(echo "$response" | tail -n1)
     response=$(echo "$response" | sed '$d')
+    http_code="${http_code:-000}"
+
+    if [[ $curl_exit_code -ne 0 ]]; then
+        local curl_error=""
+        curl_error=$(tr '\n' ' ' < "$curl_stderr_file" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+        LAST_API_CURL_EXIT_CODE="$curl_exit_code"
+        LAST_API_CURL_ERROR="$curl_error"
+        LAST_API_FAILURE_STAGE=$(classify_curl_failure_stage "$curl_exit_code" "$curl_error" "0.000000" "0.000000" "0.000000")
+        log_error "Access token request failed before any HTTP response was received."
+        log_error "  curl exit code: ${LAST_API_CURL_EXIT_CODE}"
+        if [[ -n "$LAST_API_CURL_ERROR" ]]; then
+            log_error "  curl error: $LAST_API_CURL_ERROR"
+        fi
+        log_error "  Failure stage: ${LAST_API_FAILURE_STAGE}"
+        log_error "  Host: $(get_url_host "$url")"
+        log_error "  URL: $url"
+        log_error "  Connect timeout: ${connect_timeout}s"
+        log_error "  Total timeout: ${request_timeout}s"
+        rm -f "$curl_stderr_file"
+        return 1
+    fi
+
+    rm -f "$curl_stderr_file"
 
     if [[ "$http_code" != "200" ]]; then
+        local reason
+        reason=$(get_api_error_message "$response")
         log_error "Token generation failed (HTTP $http_code)"
-        log_verbose "Response: $response"
+        if [[ -n "$reason" ]]; then
+            log_error "  Reason: $reason"
+        fi
         return 1
     fi
 
@@ -1390,6 +1731,13 @@ update_token() {
     log_verbose "Token updated in config with timestamp $timestamp"
 }
 
+clear_cached_token() {
+    local profile="$1"
+
+    delete_ini_value "$CONFIG_FILE" "$profile" "access_token"
+    delete_ini_value "$CONFIG_FILE" "$profile" "token_timestamp"
+}
+
 is_token_expired() {
     local token_timestamp="${TOKEN_TIMESTAMP:-0}"
     local current_time
@@ -1403,31 +1751,14 @@ is_token_expired() {
 # Smart site search functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Try to find MAC in the last known site (fast-path)
+# Try to find a BSSID/radio/AP MAC in the last known site's cache.
 # Returns 0 if found, 1 if not found
 # Sets global variables: AP_SERIAL, SITE_ID, SITE_NAME when found
 try_last_found_site() {
     local mac="$1"
     local last_site_id="$2"
     local last_site_name="$3"
-
     log_verbose "Checking last known location: $last_site_name..."
-
-    # Try as client first (without timeout - the API should respond quickly if site is correct)
-    local client_response
-    if client_response=$(get_client_by_mac "$mac" "$last_site_id" 2>/dev/null); then
-        local ap_serial
-        ap_serial=$(echo "$client_response" | jq -r '.connectedDeviceSerial // empty')
-
-        if [[ -n "$ap_serial" ]]; then
-            # Found as client!
-            AP_SERIAL="$ap_serial"
-            SITE_ID="$last_site_id"
-            SITE_NAME="$last_site_name"
-            log_verbose "Found in last location (as client)"
-            return 0
-        fi
-    fi
 
     # Try as BSSID/Radio MAC/AP MAC if we have cached APs for this site
     if is_aps_cache_valid "$last_site_id" "$last_site_name"; then
@@ -1481,23 +1812,16 @@ try_last_found_site() {
 }
 
 # Auto-search for MAC across all sites
-# Phase 1: Search as client in sites with >0 clients
+# Phase 1: Search globally as a client
 # Phase 2: Search as BSSID in sites with existing AP cache
-# Returns 0 if found, 1 if not found
+# Returns 0 if found, 1 if not found, 2 if incomplete, 3 on systemic API failure
 # Sets global variables: AP_SERIAL, SITE_ID, SITE_NAME when found
 auto_search_all_sites() {
     local mac="$1"
     local start_time
     start_time=$(date +%s)
     local show_progress=false
-
-    # Count sites to search
-    local sites_with_clients=0
-    for ((i=0; i<${#SITE_IDS[@]}; i++)); do
-        if [[ "${SITE_CLIENT_COUNTS[$i]}" -gt 0 ]]; then
-            ((sites_with_clients++))
-        fi
-    done
+    reset_search_state
 
     # Start progress display in background after 3 seconds
     (
@@ -1511,54 +1835,29 @@ auto_search_all_sites() {
 
     log_info "Searching for $mac..."
 
-    # Phase 1: Search as CLIENT (sites with >0 clients)
-    for ((i=0; i<${#SITE_IDS[@]}; i++)); do
-        local site_id="${SITE_IDS[$i]}"
-        local site_name="${SITE_NAMES[$i]}"
-        local client_count="${SITE_CLIENT_COUNTS[$i]}"
-        local device_count="${SITE_DEVICE_COUNTS[$i]}"
+    # Phase 1: Client detail lookup is global and returns its site.
+    local client_response
+    if get_client_by_mac_into client_response "$mac"; then
+        local ap_serial client_site_id client_site_name
+        ap_serial=$(echo "$client_response" | jq -r '.connectedDeviceSerial // empty')
+        client_site_id=$(echo "$client_response" | jq -r '.siteId // empty')
+        client_site_name=$(echo "$client_response" | jq -r '.siteName // empty')
 
-        # Skip sites with 0 clients
-        if [[ "$client_count" -eq 0 ]]; then
-            continue
+        if [[ -n "$ap_serial" && -n "$client_site_id" ]]; then
+            kill $progress_pid 2>/dev/null || true
+            wait $progress_pid 2>/dev/null || true
+            AP_SERIAL="$ap_serial"
+            SITE_ID="$client_site_id"
+            SITE_NAME="$client_site_name"
+            [[ -n "$SITE_NAME" ]] || SITE_NAME=$(find_site_by_id "$client_site_id")
+            return 0
         fi
-
-        # Show progress if > 3 seconds have elapsed
-        local elapsed=$(($(date +%s) - start_time))
-        if [[ $elapsed -ge 3 ]]; then
-            show_progress=true
-        fi
-
-        if [[ "$show_progress" == true ]]; then
-            local mins=$((elapsed / 60))
-            local secs=$((elapsed % 60))
-            log_info "$(printf '[%02d:%02d]' $mins $secs) Checking site '$site_name' ($client_count clients, $device_count APs)..."
-        fi
-
-        # Try to find client
-        local client_response
-        if client_response=$(get_client_by_mac "$mac" "$site_id" 2>/dev/null); then
-            local ap_serial
-            ap_serial=$(echo "$client_response" | jq -r '.connectedDeviceSerial // empty')
-
-            if [[ -n "$ap_serial" ]]; then
-                # Found!
-                kill $progress_pid 2>/dev/null
-                wait $progress_pid 2>/dev/null
-
-                AP_SERIAL="$ap_serial"
-                SITE_ID="$site_id"
-                SITE_NAME="$site_name"
-
-                if [[ "$show_progress" == true ]]; then
-                    log_info "$(printf '[%02d:%02d]' $mins $secs) Found in site '$site_name'!"
-                    echo ""
-                fi
-
-                return 0
-            fi
-        fi
-    done
+    elif api_error_is_systemic; then
+        kill $progress_pid 2>/dev/null || true
+        wait $progress_pid 2>/dev/null || true
+        log_error "Search aborted after a systemic Central API failure."
+        return 3
+    fi
 
     # Phase 2: Search as BSSID (sites with existing AP cache only)
     if [[ "$show_progress" == true ]]; then
@@ -1585,7 +1884,18 @@ auto_search_all_sites() {
             if [[ "$show_progress" == true ]]; then
                 log_info "Building AP cache for '$site_name' ($device_count APs)..."
             fi
-            fetch_and_cache_aps "$site_id" "$site_name"
+            local fetch_status=0
+            fetch_and_cache_aps "$site_id" "$site_name" || fetch_status=$?
+            if [[ $fetch_status -ne 0 ]]; then
+                record_failed_site "$site_name"
+                if [[ $fetch_status -eq 2 ]]; then
+                    kill $progress_pid 2>/dev/null || true
+                    wait $progress_pid 2>/dev/null || true
+                    log_error "Search aborted after a systemic Central API failure."
+                    return 3
+                fi
+                continue
+            fi
         fi
 
         local elapsed=$(($(date +%s) - start_time))
@@ -1601,6 +1911,11 @@ auto_search_all_sites() {
 
         local cache_file
         cache_file=$(get_aps_cache_file "$site_id" "$site_name")
+
+        if [[ ! -f "$cache_file" ]]; then
+            record_failed_site "$site_name"
+            continue
+        fi
 
         # Search using the same logic as find_serial_by_bssid_cached
         local found=false
@@ -1662,12 +1977,38 @@ auto_search_all_sites() {
         echo ""
     fi
 
+    if [[ "$SEARCH_INCOMPLETE" == true ]]; then
+        return 2
+    fi
+
     return 1
 }
 
 # ~~~~~~~~~~~~~
 # API functions
 # ~~~~~~~~~~~~~
+
+describe_api_wait() {
+    local endpoint="$1"
+
+    case "$endpoint" in
+        "/network-monitoring/v1/sites-health")
+            echo "Waiting on Central API: fetching site inventory..."
+            ;;
+        "/network-monitoring/v1/clients/"*)
+            echo "Waiting on Central API: checking client location..."
+            ;;
+        "/network-monitoring/v1/aps?"*)
+            echo "Waiting on Central API: fetching AP list..."
+            ;;
+        "/network-monitoring/v1/aps/"*)
+            echo "Waiting on Central API: fetching AP details..."
+            ;;
+        *)
+            echo "Waiting on Central API response..."
+            ;;
+    esac
+}
 
 api_get() {
     local endpoint="$1"
@@ -1676,6 +2017,11 @@ api_get() {
     local retry_count=0
     local auth_retry_count=0
     local max_auth_retries=3
+    local connect_timeout
+    local request_timeout
+    connect_timeout=$(get_api_connect_timeout)
+    request_timeout=$(get_api_timeout)
+    reset_api_error
 
     # Check if token needs refresh before making request
     if is_token_expired; then
@@ -1684,22 +2030,48 @@ api_get() {
             update_token "$CURRENT_PROFILE" "$NEW_ACCESS_TOKEN"
             log_verbose "New token generated successfully"
         else
+            LAST_API_ERROR_KIND="auth"
             log_error "Failed to generate access token. Check your credentials."
-            exit "$EXIT_API_ERROR"
+            return 1
         fi
     fi
+
+    log_status "$(describe_api_wait "$endpoint")"
 
     while true; do
         local headers=(-H "Authorization: Bearer $ACCESS_TOKEN" \
                        -H "Content-Type: application/json" \
                        -H "cache-control: no-cache")
+        local curl_stderr_file
+        curl_stderr_file=$(mktemp)
 
         log_verbose "GET $url"
 
-        local response http_code
-        response=$(curl -s -w "\n%{http_code}" -X GET "$url" "${headers[@]}")
-        http_code=$(echo "$response" | tail -n1)
-        response=$(echo "$response" | sed '$d')
+        local response http_code curl_exit_code curl_meta
+        local time_namelookup="0.000000" time_connect="0.000000" time_appconnect="0.000000"
+        if response=$(curl -sS -w "\n__CURL_META__%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_total}" -X GET \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$request_timeout" \
+            "$url" "${headers[@]}" \
+            2>"$curl_stderr_file"); then
+            curl_exit_code=0
+        else
+            curl_exit_code=$?
+        fi
+
+        curl_meta=$(echo "$response" | tail -n1)
+        if [[ "$curl_meta" == __CURL_META__* ]]; then
+            IFS='|' read -r http_code time_namelookup time_connect time_appconnect _ <<< "${curl_meta#__CURL_META__}"
+            response=$(echo "$response" | sed '$d')
+        else
+            http_code="$curl_meta"
+            response=$(echo "$response" | sed '$d')
+        fi
+        http_code="${http_code:-000}"
+
+        if [[ $curl_exit_code -ne 0 ]]; then
+            http_code="000"
+        fi
 
         log_verbose "HTTP $http_code"
 
@@ -1707,6 +2079,7 @@ api_get() {
             ((auth_retry_count++))
 
             if [[ $auth_retry_count -gt $max_auth_retries ]]; then
+                LAST_API_ERROR_KIND="auth"
                 log_error "Authentication failed after $max_auth_retries token refresh attempts."
                 log_error ""
                 log_error "We successfully generated a valid access token, but the endpoint is rejecting it."
@@ -1716,7 +2089,7 @@ api_get() {
                 log_error "  Profile: $CURRENT_PROFILE"
                 log_error "  Cluster URL: $CLUSTER_URL"
                 log_error "  Endpoint: $endpoint"
-                exit "$EXIT_API_ERROR"
+                return 1
             fi
 
             log_verbose "Received 401, attempting to generate new token... (attempt $auth_retry_count/$max_auth_retries)"
@@ -1726,16 +2099,18 @@ api_get() {
                 log_verbose "New token generated, retrying request..."
                 continue
             else
+                LAST_API_ERROR_KIND="auth"
                 log_error "Authentication failed. Check your credentials or run 'ap-hop config' to reconfigure."
-                exit "$EXIT_API_ERROR"
+                return 1
             fi
         fi
 
         if [[ "$http_code" == "429" ]]; then
             ((retry_count++))
             if [[ $retry_count -ge $max_retries ]]; then
+                LAST_API_ERROR_KIND="rate_limit"
                 log_error "Rate limit exceeded. Please try again later."
-                exit "$EXIT_API_ERROR"
+                return 1
             fi
             log_verbose "Rate limited, waiting 1 second... (attempt $retry_count/$max_retries)"
             sleep 1
@@ -1744,24 +2119,30 @@ api_get() {
 
         # Handle connection failures (HTTP 000 means curl couldn't connect)
         if [[ "$http_code" == "000" ]] || [[ "$http_code" =~ ^0 ]]; then
-            log_error "Failed to connect to the cluster endpoint."
-            log_error ""
-            log_error "This may indicate:"
-            log_error "  - DNS resolution failure (hostname doesn't exist)"
-            log_error "  - Network connectivity issue"
-            log_error "  - Incorrect cluster URL"
-            log_error ""
-            log_error "Current configuration:"
-            log_error "  Profile: $CURRENT_PROFILE"
-            log_error "  Cluster URL: $CLUSTER_URL"
-            log_error "  Endpoint: $endpoint"
-            log_error "  Full URL: $url"
-            exit "$EXIT_API_ERROR"
+            LAST_API_ERROR_KIND="connect"
+            LAST_API_CURL_EXIT_CODE="$curl_exit_code"
+            LAST_API_CURL_ERROR=$(tr '\n' ' ' < "$curl_stderr_file" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+            LAST_API_FAILURE_STAGE=$(classify_curl_failure_stage "$curl_exit_code" "$LAST_API_CURL_ERROR" "$time_namelookup" "$time_connect" "$time_appconnect")
+            report_curl_transport_failure "$url" "$endpoint" "$connect_timeout" "$request_timeout"
+            rm -f "$curl_stderr_file"
+            return 1
         fi
 
+        rm -f "$curl_stderr_file"
+
         if [[ "$http_code" != "200" ]]; then
+            if [[ "$http_code" == "404" && "$endpoint" == /network-monitoring/v1/clients/* ]]; then
+                LAST_API_ERROR_KIND="not_found"
+            elif [[ "$http_code" == "403" ]]; then
+                LAST_API_ERROR_KIND="permission"
+            else
+                LAST_API_ERROR_KIND="http_error"
+            fi
+            if [[ "$LAST_API_ERROR_KIND" != "not_found" ]]; then
+                report_http_api_error "$http_code" "$endpoint" "$response"
+            fi
             echo "$response"
-            return "$http_code"
+            return 1
         fi
 
         log_verbose "Response body length: ${#response} bytes"
@@ -1771,27 +2152,56 @@ api_get() {
     done
 }
 
-get_client_by_mac() {
-    local mac="$1"
-    local site_id="$2"
+api_get_into() {
+    local __resultvar="$1"
+    local endpoint="$2"
+    local temp_file
+    temp_file=$(mktemp)
+
+    if api_get "$endpoint" > "$temp_file"; then
+        printf -v "$__resultvar" '%s' "$(cat "$temp_file")"
+        rm -f "$temp_file"
+        return 0
+    else
+        local status=$?
+        if [[ -f "$temp_file" ]]; then
+            printf -v "$__resultvar" '%s' "$(cat "$temp_file")"
+            rm -f "$temp_file"
+        fi
+        return "$status"
+    fi
+}
+
+get_client_by_mac_into() {
+    local __resultvar="$1"
+    local mac="$2"
 
     local encoded_mac="${mac//:/%3A}"
+    local endpoint="/network-monitoring/v1/clients/${encoded_mac}"
 
-    local endpoint="/network-monitoring/v1alpha1/clients/${encoded_mac}?site-id=${site_id}"
-
-    api_get "$endpoint"
+    api_get_into "$__resultvar" "$endpoint"
 }
 
 get_serial_by_bssid() {
     local bssid="$1"
     local site_id="$2"
     local site_name="$3"
+    LAST_BSSID_LOOKUP_STATUS="not_found"
 
     if ! is_aps_cache_valid "$site_id" "$site_name"; then
         if ! fetch_and_cache_aps "$site_id" "$site_name"; then
+            LAST_BSSID_LOOKUP_STATUS="incomplete"
             echo "Failed to build AP cache for site '$site_name'" >&2
             return 1
         fi
+    fi
+
+    local cache_file
+    cache_file=$(get_aps_cache_file "$site_id" "$site_name")
+    if [[ ! -f "$cache_file" ]]; then
+        LAST_BSSID_LOOKUP_STATUS="incomplete"
+        echo "AP cache unavailable for site '$site_name'" >&2
+        return 1
     fi
 
     local result
@@ -1806,7 +2216,7 @@ get_serial_by_bssid() {
     if [[ "$VERIFY_AP_STATUS" == true ]]; then
         echo "Verifying AP status..." >&2
         local ap_response
-        ap_response=$(api_get "/network-monitoring/v1alpha1/aps/${serial}" 2>/dev/null) || {
+        api_get_into ap_response "/network-monitoring/v1/aps/${serial}" 2>/dev/null || {
             echo "Warning: Failed to verify AP status" >&2
         }
 
@@ -1830,6 +2240,7 @@ get_serial_by_bssid() {
     AP_MAC="$mac"
     AP_IP="$ip"
     MATCH_TYPE="$match_type"
+    LAST_BSSID_LOOKUP_STATUS="found"
 
     echo "$serial"
     return 0
@@ -1837,9 +2248,16 @@ get_serial_by_bssid() {
 
 get_ap_by_serial() {
     local serial="$1"
-    local endpoint="/network-monitoring/v1alpha1/aps/$serial"
+    local endpoint="/network-monitoring/v1/aps/$serial"
 
     api_get "$endpoint"
+}
+
+get_ap_by_serial_into() {
+    local __resultvar="$1"
+    local serial="$2"
+
+    api_get_into "$__resultvar" "/network-monitoring/v1/aps/$serial"
 }
 
 # ~~~~~~~~~~~~~
@@ -2053,7 +2471,7 @@ cmd_lookup() {
 
     # === SITE SELECTION ===
 
-    local site_id site_name site_client_count ap_serial lookup_method goto_ap_details
+    local site_id site_name ap_serial lookup_method goto_ap_details
     site_id=""
     site_name=""
     ap_serial=""
@@ -2130,9 +2548,16 @@ cmd_lookup() {
                 lookup_method="AUTOSEARCH"
                 goto_ap_details=true
             else
+                local search_status=$?
                 # Not found anywhere - offer options
                 echo ""
-                log_error "MAC address $normalized_input not found in any site."
+                if [[ $search_status -eq 3 ]]; then
+                    exit "$EXIT_API_ERROR"
+                elif [[ $search_status -eq 2 ]]; then
+                    report_incomplete_search "$normalized_input"
+                else
+                    log_error "MAC address $normalized_input not found in any site."
+                fi
                 echo ""
 
                 # Read from terminal if available and interactive mode is enabled
@@ -2156,9 +2581,14 @@ cmd_lookup() {
                 if [[ "$response" =~ ^[Rr]$ ]]; then
                     # Refresh and retry
                     log_info "Refreshing sites cache..."
-                    invalidate_sites_cache
-                    fetch_and_cache_sites "$CURRENT_PROFILE"
-                    load_cached_sites
+                    if ! fetch_and_cache_sites "$CURRENT_PROFILE"; then
+                        log_error "Could not refresh sites from Central. Keeping existing cache."
+                        exit "$EXIT_API_ERROR"
+                    fi
+                    if ! load_cached_sites; then
+                        log_error "Failed to load refreshed sites cache"
+                        exit "$EXIT_ERROR"
+                    fi
 
                     log_info "Searching again..."
                     if auto_search_all_sites "$normalized_input"; then
@@ -2173,8 +2603,15 @@ cmd_lookup() {
                         lookup_method="AUTOSEARCH"
                         goto_ap_details=true
                     else
-                        log_error "Still not found after refreshing sites."
-                        log_error "The device may be offline or not connected to any site."
+                        search_status=$?
+                        if [[ $search_status -eq 3 ]]; then
+                            exit "$EXIT_API_ERROR"
+                        elif [[ $search_status -eq 2 ]]; then
+                            report_incomplete_search "$normalized_input"
+                        else
+                            log_error "Still not found after refreshing sites."
+                            log_error "The device may be offline or not connected to any site."
+                        fi
                         exit "$EXIT_API_ERROR"
                     fi
                 elif [[ "$response" =~ ^[Mm]$ ]]; then
@@ -2185,9 +2622,14 @@ cmd_lookup() {
                     if [[ "$SELECTED_SITE_ID" == "__REFRESH__" ]]; then
                         # User chose to refresh from the site menu
                         log_info "Refreshing sites cache..."
-                        invalidate_sites_cache
-                        fetch_and_cache_sites "$CURRENT_PROFILE"
-                        load_cached_sites
+                        if ! fetch_and_cache_sites "$CURRENT_PROFILE"; then
+                            log_error "Could not refresh sites from Central. Keeping existing cache."
+                            exit "$EXIT_API_ERROR"
+                        fi
+                        if ! load_cached_sites; then
+                            log_error "Failed to load refreshed sites cache"
+                            exit "$EXIT_ERROR"
+                        fi
 
                         # Show site selection again
                         select_site
@@ -2219,7 +2661,7 @@ cmd_lookup() {
         # Try 1: Lookup as client MAC
         log_info "Looking up: $normalized_input..."
 
-        if client_response=$(get_client_by_mac "$normalized_input" "$site_id" 2>/dev/null); then
+        if get_client_by_mac_into client_response "$normalized_input"; then
             # Display verbose client details FIRST (before validation)
             if [[ "$VERBOSE" == true ]]; then
                 echo ""
@@ -2235,16 +2677,24 @@ cmd_lookup() {
 
             # Success - extract serial
             ap_serial=$(echo "$client_response" | jq -r '.connectedDeviceSerial // empty')
+            local client_site_id
+            client_site_id=$(echo "$client_response" | jq -r '.siteId // empty')
             lookup_method="MAC"
 
-            if [[ -z "$ap_serial" ]]; then
-                log_error "Client found but no AP serial in response"
+            if [[ -n "$client_site_id" && "$client_site_id" != "$site_id" ]]; then
+                ap_serial=""
+                log_info "Client is connected to a different site, trying as BSSID..."
+            elif [[ -z "$ap_serial" ]]; then
+                log_info "Client has no connected AP, trying as BSSID..."
+            fi
+        else
+            if api_error_is_systemic; then
                 exit "$EXIT_API_ERROR"
             fi
-
-        else
             log_info "Client not found, trying as BSSID..."
+        fi
 
+        if [[ -z "$ap_serial" ]]; then
             # Capture stdout while allowing the function to set global variables
             # Use a temp file to avoid subshell that would lose global variable assignments
             local temp_file
@@ -2256,7 +2706,11 @@ cmd_lookup() {
                 log_info "Found by BSSID"
             else
                 rm -f "$temp_file"
-                log_error "$normalized_input not found in site '$site_name'"
+                if [[ "$LAST_BSSID_LOOKUP_STATUS" == "incomplete" ]]; then
+                    report_incomplete_site_lookup "$normalized_input" "$site_name"
+                else
+                    log_error "$normalized_input not found in site '$site_name'"
+                fi
                 exit "$EXIT_API_ERROR"
             fi
         fi
@@ -2274,8 +2728,10 @@ cmd_lookup() {
         log_verbose "Looking up AP $ap_serial..."
 
         local ap_response
-        if ! ap_response=$(get_ap_by_serial "$ap_serial"); then
-            if ! is_valid_json "$ap_response"; then
+        if ! get_ap_by_serial_into ap_response "$ap_serial"; then
+            if api_error_is_hard && [[ -z "$ap_response" ]]; then
+                log_error "Failed to look up AP $ap_serial - no API response received"
+            elif ! is_valid_json "$ap_response"; then
                 log_error "Failed to look up AP $ap_serial - invalid response from server"
                 log_verbose "Response: $ap_response"
             else
@@ -2337,6 +2793,8 @@ cmd_lookup() {
         log_info "Dry run - not connecting. Would SSH to $SSH_USER@$ap_ip"
         exit "$EXIT_SUCCESS"
     fi
+
+    log_info "Central lookup complete. Starting SSH connection to $SSH_USER@$ap_ip..."
 
     # Get SSH password
     local password
@@ -2413,6 +2871,8 @@ cmd_shell() {
             site_name="$SITE_NAME"
             ap_serial="$AP_SERIAL"
             log_info "Found in last location: $site_name"
+        else
+            log_verbose "Not in last location, searching all sites..."
         fi
     fi
 
@@ -2425,15 +2885,26 @@ cmd_shell() {
             ap_serial="$AP_SERIAL"
             log_info "Found in site: $site_name"
         else
-            log_error "MAC address $normalized_input not found in any site"
+            local search_status=$?
+            if [[ $search_status -eq 3 ]]; then
+                exit "$EXIT_API_ERROR"
+            elif [[ $search_status -eq 2 ]]; then
+                report_incomplete_search "$normalized_input"
+            else
+                log_error "MAC address $normalized_input not found in any site"
+            fi
             exit "$EXIT_API_ERROR"
         fi
     fi
 
     # Get AP details
     local ap_response ap_name ap_mac ap_ip ap_status
-    if ! ap_response=$(get_ap_by_serial "$ap_serial"); then
-        log_error "Failed to look up AP $ap_serial"
+    if ! get_ap_by_serial_into ap_response "$ap_serial"; then
+        if api_error_is_hard && [[ -z "$ap_response" ]]; then
+            log_error "Failed to look up AP $ap_serial - no API response received"
+        else
+            log_error "Failed to look up AP $ap_serial"
+        fi
         exit "$EXIT_API_ERROR"
     fi
 
@@ -2459,6 +2930,8 @@ cmd_shell() {
         log_info "Dry run - would connect and escalate to root shell"
         exit "$EXIT_SUCCESS"
     fi
+
+    log_info "Central lookup complete. Starting SSH root-shell connection to $SSH_USER@$ap_ip..."
 
     # Get SSH password
     local password
@@ -2486,10 +2959,16 @@ cmd_list_sites() {
 
     if ! is_sites_cache_valid; then
         log_info "Cache expired, fetching sites..."
-        fetch_and_cache_sites
+        if ! fetch_and_cache_sites; then
+            log_error "Failed to fetch sites"
+            exit "$EXIT_ERROR"
+        fi
     fi
 
-    load_cached_sites
+    if ! load_cached_sites; then
+        log_error "Failed to load sites cache"
+        exit "$EXIT_ERROR"
+    fi
 
     local cache_file
     cache_file=$(get_sites_cache_file)
@@ -2538,8 +3017,10 @@ cmd_refresh_sites() {
     load_profile "$CURRENT_PROFILE"
 
     log_info "Refreshing site cache..."
-    invalidate_sites_cache
-    fetch_and_cache_sites
+    if ! fetch_and_cache_sites; then
+        log_error "Failed to refresh site cache"
+        exit "$EXIT_ERROR"
+    fi
 
     log_info "Site cache refreshed"
     echo ""
@@ -2559,10 +3040,16 @@ cmd_list_aps() {
 
     if ! is_sites_cache_valid; then
         log_info "Cache expired, fetching sites..."
-        fetch_and_cache_sites
+        if ! fetch_and_cache_sites; then
+            log_error "Failed to fetch sites"
+            exit "$EXIT_ERROR"
+        fi
     fi
 
-    load_cached_sites
+    if ! load_cached_sites; then
+        log_error "Failed to load sites cache"
+        exit "$EXIT_ERROR"
+    fi
 
     local site_id site_name
     if [[ -n "$SITE_ID_FILTER" ]]; then
@@ -2626,10 +3113,16 @@ cmd_refresh_aps() {
 
     if ! is_sites_cache_valid; then
         log_info "Fetching sites..."
-        fetch_and_cache_sites
+        if ! fetch_and_cache_sites; then
+            log_error "Failed to fetch sites"
+            exit "$EXIT_ERROR"
+        fi
     fi
 
-    load_cached_sites
+    if ! load_cached_sites; then
+        log_error "Failed to load sites cache"
+        exit "$EXIT_ERROR"
+    fi
 
     local site_id site_name
     if [[ -n "$SITE_ID_FILTER" ]]; then
@@ -2649,8 +3142,6 @@ cmd_refresh_aps() {
     fi
 
     log_info "Refreshing AP cache for '$site_name'..."
-    invalidate_aps_cache "$site_id" "$site_name"
-
     if ! fetch_and_cache_aps "$site_id" "$site_name"; then
         log_error "Failed to refresh AP cache"
         exit "$EXIT_ERROR"
@@ -2769,8 +3260,8 @@ ENVIRONMENT VARIABLES:
 FILES:
     \$XDG_CONFIG_HOME/$SCRIPT_NAME/config            Profile configuration
     \$XDG_CONFIG_HOME/$SCRIPT_NAME/clusters          Cluster URL definitions
-    \$XDG_CONFIG_HOME/$SCRIPT_NAME/sites_cache       Site cache (24hr TTL)
-    \$XDG_CONFIG_HOME/$SCRIPT_NAME/aps_cache_*       AP cache per site (24hr TTL)
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/sites_cache_*     Site cache per profile/cluster (24hr TTL)
+    \$XDG_CONFIG_HOME/$SCRIPT_NAME/aps_cache_*       AP cache per profile/site (24hr TTL)
 
 EOF
 }
@@ -2836,7 +3327,8 @@ _ap-hop() {
 
     # Get config directory for reading sites and profiles
     local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ap-hop"
-    local sites_cache="$config_dir/sites_cache"
+    local sites_cache
+    sites_cache=$(ls -1t "$config_dir"/sites_cache_* 2>/dev/null | head -n1)
     local config_file="$config_dir/config"
 
     # Complete options after ap-hop
@@ -2925,7 +3417,8 @@ _ap-hop() {
 
     # Get config directory
     local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ap-hop"
-    local sites_cache="$config_dir/sites_cache"
+    local sites_cache
+    sites_cache=$(ls -1t "$config_dir"/sites_cache_* 2>/dev/null | head -n1)
     local config_file="$config_dir/config"
 
     # Helper function to get profiles from config
@@ -3252,12 +3745,10 @@ EOF
 # Option parsing helper
 # ~~~~~~~~~~~~~~~~~~~~~
 
-# Parse options from an array and set global variables
-# Returns the number of arguments consumed
+# Parse options from the remaining positional arguments and set global variables
 parse_options() {
-    local -n args=$1
+    local args=("$@")
     local i=0
-    local consumed=0
 
     while [[ $i -lt ${#args[@]} ]]; do
         case "${args[$i]}" in
@@ -3268,7 +3759,6 @@ parse_options() {
                 fi
                 PROFILE="${args[$((i + 1))]}"
                 i=$((i + 2))
-                consumed=$((consumed + 2))
                 ;;
             --site)
                 if [[ $((i + 1)) -ge ${#args[@]} ]]; then
@@ -3277,7 +3767,6 @@ parse_options() {
                 fi
                 SITE_FILTER="${args[$((i + 1))]}"
                 i=$((i + 2))
-                consumed=$((consumed + 2))
                 ;;
             --site-id)
                 if [[ $((i + 1)) -ge ${#args[@]} ]]; then
@@ -3286,33 +3775,27 @@ parse_options() {
                 fi
                 SITE_ID_FILTER="${args[$((i + 1))]}"
                 i=$((i + 2))
-                consumed=$((consumed + 2))
                 ;;
             --all)
                 SHOW_ALL_SITES=true
                 i=$((i + 1))
-                consumed=$((consumed + 1))
                 ;;
             --verify)
                 VERIFY_AP_STATUS=true
                 i=$((i + 1))
-                consumed=$((consumed + 1))
                 ;;
             --non-interactive)
                 NON_INTERACTIVE=true
                 i=$((i + 1))
-                consumed=$((consumed + 1))
                 ;;
             -v|--verbose)
                 VERBOSE=true
                 i=$((i + 1))
-                consumed=$((consumed + 1))
                 ;;
             -n|--dry-run)
                 DRY_RUN=true
                 VERBOSE=true
                 i=$((i + 1))
-                consumed=$((consumed + 1))
                 ;;
             -*)
                 log_error "Unknown option: ${args[$i]}"
@@ -3325,7 +3808,7 @@ parse_options() {
         esac
     done
 
-    return $consumed
+    return 0
 }
 
 main() {
@@ -3521,7 +4004,7 @@ main() {
             # Parse any options after the MAC address
             if [[ ${#positional_args[@]} -gt 2 ]]; then
                 local remaining_args=("${positional_args[@]:2}")
-                parse_options remaining_args
+                parse_options "${remaining_args[@]}"
             fi
         fi
 
@@ -3530,7 +4013,7 @@ main() {
         # MAC/BSSID address provided - parse any options after it
         if [[ ${#positional_args[@]} -gt 1 ]]; then
             local remaining_args=("${positional_args[@]:1}")
-            parse_options remaining_args
+            parse_options "${remaining_args[@]}"
         fi
         cmd_lookup "$first_arg"
     else
