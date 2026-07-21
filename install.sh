@@ -8,7 +8,8 @@ set -euo pipefail
 
 readonly INSTALL_DIR="$HOME/.local/bin"
 readonly SCRIPT_NAME="ap-hop"
-readonly SCRIPT_URL="https://raw.githubusercontent.com/joshschmelzle/ap-hop/main/ap-hop"
+readonly RELEASE_REF="${AP_HOP_RELEASE_REF:-main}"
+readonly SCRIPT_URL="https://raw.githubusercontent.com/joshschmelzle/ap-hop/$RELEASE_REF/ap-hop"
 
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -34,6 +35,13 @@ error() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+validate_release_ref() {
+    if [[ "$RELEASE_REF" != "main" && ! "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        error "Invalid release ref: $RELEASE_REF"
+        exit 1
+    fi
 }
 
 get_install_cmd() {
@@ -272,6 +280,7 @@ main() {
     echo "╚═══════════════════════════════════════╝"
     echo ""
 
+    validate_release_ref
     check_dependencies
     echo ""
     install_script

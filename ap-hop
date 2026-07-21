@@ -11,7 +11,7 @@ set -euo pipefail
 # Constants
 # ~~~~~~~~~
 
-readonly VERSION="0.0.8"
+readonly VERSION="0.0.9"
 readonly SCRIPT_NAME="ap-hop"
 readonly DEFAULT_SSH_USER="admin"
 readonly DEFAULT_SSH_TIMEOUT=10
@@ -3511,14 +3511,17 @@ COMPLETION_EOF
 # Update functions
 # ~~~~~~~~~~~~~~~~~
 
-readonly UPDATE_URL="https://raw.githubusercontent.com/joshschmelzle/ap-hop/main/ap-hop"
-readonly INSTALLER_URL="https://wifi.lol/ap-hop"
+readonly TAGS_URL="https://api.github.com/repos/joshschmelzle/ap-hop/tags?per_page=100"
+readonly RAW_BASE_URL="https://raw.githubusercontent.com/joshschmelzle/ap-hop"
 readonly UPDATE_CHECK_INTERVAL=86400
 
 get_latest_version() {
-    local version
-    version=$(curl -fsSL --max-time 5 "$UPDATE_URL" 2>/dev/null | grep -m1 '^readonly VERSION=' | cut -d'"' -f2)
-    echo "$version"
+    curl -fsSL --max-time 5 \
+        -H "Accept: application/vnd.github+json" \
+        "$TAGS_URL" 2>/dev/null |
+        jq -r '.[].name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | ltrimstr("v")' |
+        sort -V |
+        tail -n1
 }
 
 version_ge() {
@@ -3691,9 +3694,11 @@ EOF
 
     local installer_file
     installer_file=$(mktemp)
+    local release_tag="v$latest_version"
+    local installer_url="$RAW_BASE_URL/$release_tag/install.sh"
 
-    if ! curl -fsSL "$INSTALLER_URL" -o "$installer_file"; then
-        log_error "Failed to download installer from $INSTALLER_URL"
+    if ! curl -fsSL "$installer_url" -o "$installer_file"; then
+        log_error "Failed to download installer for $release_tag"
         rm -f "$installer_file"
         exit "$EXIT_ERROR"
     fi
@@ -3704,7 +3709,7 @@ EOF
         exit "$EXIT_ERROR"
     fi
 
-    if ! bash "$installer_file"; then
+    if ! AP_HOP_RELEASE_REF="$release_tag" bash "$installer_file"; then
         log_error "Installer failed. Update aborted."
         rm -f "$installer_file"
         exit "$EXIT_ERROR"
